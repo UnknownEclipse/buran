@@ -13,6 +13,7 @@ pub use self::page_cache::PageId;
 use crate::Result;
 
 mod page_cache;
+mod wal;
 
 /// # The Storage Layer
 ///

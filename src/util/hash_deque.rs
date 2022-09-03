@@ -4,6 +4,9 @@ use std::{
     hash::{BuildHasher, Hash},
 };
 
+use backtrace::Backtrace;
+use slab::Slab;
+
 mod tests;
 
 /// A linked deque for small, cheaply hashable types that stores it's metdata in a
@@ -183,6 +186,193 @@ where
             head: Default::default(),
             tail: Default::default(),
             data: Default::default(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct HashSlabDeque<T, S = RandomState> {
+    head: Option<usize>,
+    tail: Option<usize>,
+    links: Slab<(T, Links<usize>)>,
+    keys: HashMap<T, usize, S>,
+}
+
+impl<T, S> Debug for HashSlabDeque<T, S>
+where
+    T: Copy + Hash + Eq + Debug,
+    S: BuildHasher,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut list = f.debug_list();
+
+        let mut cur = self.head;
+        while let Some(entry) = cur {
+            list.entry(&entry);
+            cur = self.links(entry).next;
+        }
+        list.finish()
+    }
+}
+
+impl<T> HashSlabDeque<T> {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_hasher(capacity, Default::default())
+    }
+}
+
+impl<T, S> HashSlabDeque<T, S> {
+    pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Self {
+        Self {
+            head: None,
+            tail: None,
+            links: Slab::with_capacity(capacity),
+            keys: HashMap::with_capacity_and_hasher(capacity, hasher),
+        }
+    }
+}
+
+impl<T, S> HashSlabDeque<T, S>
+where
+    T: Clone + Eq + Hash,
+    S: BuildHasher,
+{
+    pub fn first(&self) -> Option<&T> {
+        self.head.map(|i| &self.links[i].0)
+    }
+
+    pub fn last(&self) -> Option<&T> {
+        self.tail.map(|i| &self.links[i].0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn remove(&mut self, item: T) -> bool {
+        let key = match self.keys.get(&item) {
+            Some(key) => *key,
+            None => return false,
+        };
+        self.remove_key(key).is_some()
+    }
+
+    fn remove_key(&mut self, key: usize) -> Option<T> {
+        if !self.links.contains(key) {
+            return None;
+        }
+
+        let (item, Links { next, prev }) = self.links.remove(key);
+        self.keys.remove(&item);
+
+        if let Some(next) = next {
+            self.set_prev(next, prev);
+        } else {
+            self.tail = prev;
+        }
+        if let Some(prev) = prev {
+            self.set_next(prev, next);
+        } else {
+            self.head = next;
+        }
+        Some(item)
+    }
+
+    pub fn push_front(&mut self, item: T) -> bool {
+        use std::collections::hash_map::Entry::*;
+
+        let key = match self.keys.entry(item.clone()) {
+            Occupied(_) => return false,
+            Vacant(e) => {
+                let links = Links {
+                    next: self.head,
+                    prev: None,
+                };
+                let key = self.links.insert((item, links));
+                e.insert(key);
+                key
+            }
+        };
+
+        if let Some(next) = self.head {
+            self.set_prev(next, Some(key));
+        } else {
+            self.tail = Some(key);
+        }
+        self.head = Some(key);
+        true
+    }
+
+    pub fn push_back(&mut self, item: T) -> bool {
+        use std::collections::hash_map::Entry::*;
+
+        let key = match self.keys.entry(item.clone()) {
+            Occupied(_) => return false,
+            Vacant(e) => {
+                let links = Links {
+                    next: None,
+                    prev: self.tail,
+                };
+                let key = self.links.insert((item, links));
+                e.insert(key);
+                key
+            }
+        };
+
+        if let Some(tail) = self.tail {
+            self.set_next(tail, Some(key));
+        } else {
+            self.head = Some(key);
+        }
+        self.tail = Some(key);
+        true
+    }
+
+    pub fn pop_front(&mut self) -> Option<T> {
+        let head = self.head?;
+        self.remove_key(head)
+    }
+
+    pub fn pop_back(&mut self) -> Option<T> {
+        let tail = self.tail?;
+        self.remove_key(tail)
+    }
+
+    fn set_next(&mut self, key: usize, next: Option<usize>) {
+        self.links_mut(key).next = next;
+    }
+
+    fn set_prev(&mut self, key: usize, prev: Option<usize>) {
+        self.links_mut(key).prev = prev;
+    }
+
+    fn links(&self, key: usize) -> &Links<usize> {
+        &self.links[key].1
+    }
+
+    fn links_mut(&mut self, key: usize) -> &mut Links<usize> {
+        &mut self.links[key].1
+    }
+}
+
+impl<T, S> Default for HashSlabDeque<T, S>
+where
+    S: Default,
+{
+    fn default() -> Self {
+        Self {
+            head: Default::default(),
+            tail: Default::default(),
+            keys: Default::default(),
+            links: Default::default(),
         }
     }
 }

@@ -115,6 +115,7 @@ impl File {
                 if *n <= 1 {
                     set_lock(&self.file, LockState::Unlocked)?;
                     data.state = LockState::Unlocked;
+                    data.retired.clear();
                 } else {
                     *n -= 1;
                 }
@@ -139,6 +140,7 @@ impl File {
                 }
                 set_lock(&self.file, LockState::Unlocked)?;
                 data.state = LockState::Unlocked;
+                data.retired.clear();
                 Ok(())
             }
             LockState::Shared(_) => {

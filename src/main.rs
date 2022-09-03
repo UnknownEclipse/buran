@@ -1,5 +1,6 @@
 use std::{fs, io::Read};
 
+use ahash::AHashMap;
 use buran::Result;
 use rustix::fs::FileExt;
 use tempfile::tempfile;
@@ -14,5 +15,7 @@ fn main() -> Result<()> {
     f.read_to_end(&mut buf)?;
     let s = String::from_utf8_lossy(&buf);
     dbg!(buf);
+    let mut map = AHashMap::new();
+    map.insert(1, 2);
     Ok(())
 }

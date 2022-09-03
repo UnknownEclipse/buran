@@ -1,4 +1,4 @@
-use super::CacheBuilder;
+use super::TinyLfuBuilder;
 
 // #[test]
 // fn test_tiny_lfu() {

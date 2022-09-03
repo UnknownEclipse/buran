@@ -14,7 +14,7 @@ use moka::sync::Cache;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
-use crate::{device::Device, Result};
+use crate::Result;
 
 use self::wal::Wal;
 
@@ -61,8 +61,7 @@ pub struct PageCache {
     last_commit_lsn: AtomicU64,
 
     wal: Wal,
-
-    heap: Device,
+    // heap: Device,
 }
 
 pub struct CheckpointGuard<'a> {

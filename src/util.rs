@@ -2,6 +2,7 @@ pub mod aligned_slice;
 pub mod alloc_aligned;
 pub mod buffer_cache;
 pub mod count_min;
+pub mod hash;
 pub mod hash_deque;
 pub mod hash_lru;
 pub mod slice;

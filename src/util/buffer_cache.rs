@@ -1,14 +1,22 @@
-use std::{hash::BuildHasherDefault, num::NonZeroU64, ops::Deref, sync::Arc, thread};
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    ops::{Deref, Not, Shl},
+    sync::{Arc, Weak},
+    thread,
+};
 
 use dashmap::DashMap;
-use flume::{Receiver, Sender};
+use flume::{bounded, unbounded, Receiver, Sender};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
-use rustc_hash::FxHasher;
 
 use crate::{Error, ErrorKind, Result};
 
-use super::{thread_id::ThreadId, tiny_lfu::TinyLfu};
+use super::{
+    hash::TinyHashBuilder,
+    thread_id::ThreadId,
+    tiny_lfu::{HillClimberBuilder, HillClimberTinyLfu},
+};
 
 pub struct BufferCache<A>
 where
@@ -20,27 +28,27 @@ where
 pub trait Adapter {
     /// The buffer type used by this adapter. This will generally be some variant
     /// of `Arc<Box<[u8]>>`.
-    type Buffer: Clone + Deref<Target = [u8]>;
+    type Buffer: Deref<Target = [u8]>;
 
     fn flush(&self, pg: NonZeroU64, buffer: &Self::Buffer) -> Result<()>;
 
-    fn fault(&self, pg: NonZeroU64) -> Result<Self::Buffer>;
+    fn fault(&self, pg: NonZeroU64) -> Result<Arc<Self::Buffer>>;
 }
 
 impl<A> BufferCache<A>
 where
     A: Adapter,
 {
-    pub fn get(&self, pg: NonZeroU64) -> Result<A::Buffer> {
+    pub fn get(&self, pg: NonZeroU64) -> Result<Arc<A::Buffer>> {
         use dashmap::mapref::entry::Entry::*;
 
         self.check_background_error_state()?;
 
-        let buffer = match self.inner.buffers.entry(pg) {
+        let (_, buffer) = match self.inner.buffers.entry(pg) {
             Occupied(entry) => entry.get().clone(),
             Vacant(entry) => {
                 let buffer = self.inner.adapter.fault(pg)?;
-                entry.insert(buffer).clone()
+                entry.insert((false, buffer)).clone()
             }
         };
         self.inner.record_read(pg);
@@ -48,9 +56,9 @@ where
     }
 
     /// Write a buffer at the given index. The write may occur asynchronously.
-    pub fn insert(&self, pg: NonZeroU64, buffer: A::Buffer) -> Result<()> {
+    pub fn write(&self, pg: NonZeroU64, buffer: Arc<A::Buffer>) -> Result<()> {
         self.check_background_error_state()?;
-        self.inner.buffers.insert(pg, buffer);
+        self.inner.buffers.insert(pg, (true, buffer));
         self.inner.record_read(pg);
         Ok(())
     }
@@ -64,23 +72,74 @@ where
     }
 }
 
+pub struct BufferCacheBuilder {
+    read_buffer_shards: usize,
+    read_buffer_shard_capacity: usize,
+    cache_builder: HillClimberBuilder,
+    evicted_chan_buffer_size: Option<NonZeroUsize>,
+}
+
+impl BufferCacheBuilder {
+    pub fn build<A>(&self, adapter: A) -> BufferCache<A>
+    where
+        A: 'static + Adapter + Send + Sync,
+        A::Buffer: 'static + Send + Sync,
+    {
+        let cache = self.cache_builder.build_with_hasher(Default::default());
+
+        let (evicted_tx, evicted_rx) = self
+            .evicted_chan_buffer_size
+            .map(|size| bounded(size.get()))
+            .unwrap_or_else(unbounded);
+
+        let read_buffer_shards_count = self.read_buffer_shards.next_power_of_two();
+        let read_buffer_shard_mask = {
+            let trailing = read_buffer_shards_count.trailing_zeros();
+            u64::MAX.wrapping_shr(trailing).shl(trailing).not()
+        };
+
+        let mut read_buffer_shards = Vec::new();
+        read_buffer_shards.resize_with(read_buffer_shards_count, || {
+            Vec::with_capacity(self.read_buffer_shard_capacity).into()
+        });
+        let read_buffer_shards = read_buffer_shards.into_boxed_slice();
+
+        let inner = Inner {
+            adapter,
+            deferred_evictions: Default::default(),
+            cache_reads: read_buffer_shards,
+            cache_shard_mask: read_buffer_shard_mask,
+            cache_state: Mutex::new(cache),
+            evicted: evicted_tx,
+            buffers: DashMap::with_hasher(Default::default()),
+            background_error: OnceCell::new(),
+        };
+
+        let inner = Arc::new(inner);
+
+        start_eviction_thread(evicted_rx, inner.clone());
+
+        BufferCache { inner }
+    }
+}
+
 struct Inner<A>
 where
     A: Adapter,
 {
-    buffers: DashMap<NonZeroU64, A::Buffer, BuildHasherDefault<FxHasher>>,
+    buffers: DashMap<NonZeroU64, (bool, Arc<A::Buffer>), TinyHashBuilder>,
     evicted: Sender<NonZeroU64>,
+    deferred_evictions: DashMap<NonZeroU64, Weak<A::Buffer>>,
     /// The cache policy itself. Accesses are buffered in a series of sharded deques and
     /// the cache itself is only unlocked when those buffers are full. This helps
     /// minimize contention.
-    cache_state: Mutex<TinyLfu<NonZeroU64, BuildHasherDefault<FxHasher>>>,
+    cache_state: Mutex<HillClimberTinyLfu<NonZeroU64, TinyHashBuilder>>,
     /// Cache access buffer shards.
     cache_reads: Box<[Mutex<Vec<NonZeroU64>>]>,
     cache_shard_mask: u64,
     /// An error occurred in a background thread.
     // TODO: Should we allow clearing this?
     background_error: OnceCell<Arc<ErrorKind>>,
-
     adapter: A,
 }
 
@@ -104,7 +163,7 @@ where
         let mut cache_state = self.cache_state.lock();
 
         for pg in shard.iter() {
-            if let Some(evictee) = cache_state.insert(*pg) {
+            for evictee in cache_state.insert(*pg) {
                 self.evicted.send(evictee).unwrap();
             }
         }
@@ -120,10 +179,19 @@ where
 {
     thread::spawn(move || {
         for pg in evicted {
-            let buffer = match inner.buffers.remove(&pg) {
+            let (modified, buffer) = match inner.buffers.remove(&pg) {
                 Some((_, buffer)) => buffer,
                 None => continue,
             };
+
+            if 1 < Arc::strong_count(&buffer) {
+                inner.deferred_evictions.insert(pg, Arc::downgrade(&buffer));
+            }
+
+            if !modified {
+                continue;
+            }
+
             match inner.adapter.flush(pg, &buffer) {
                 Ok(_) => {}
                 Err(error) => {

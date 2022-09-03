@@ -35,22 +35,15 @@ impl buffer_cache::Adapter for Adapter {
         Ok(())
     }
 
-    fn fault(&self, pg: NonZeroU64) -> crate::Result<Self::Buffer> {
+    fn fault(&self, pg: NonZeroU64) -> crate::Result<Arc<Self::Buffer>> {
         let offset = self.offset(pg);
         let mut buf = alloc_aligned_slice_zeroed(self.segment_size, self.block_size);
         self.file.read_exact_at(&mut buf, offset)?;
-        Ok(Buffer {
-            arc: Arc::new(BufferInner { data: buf }),
-        })
+        Ok(Arc::new(Buffer { data: buf }))
     }
 }
 
-#[derive(Clone)]
 pub struct Buffer {
-    arc: Arc<BufferInner>,
-}
-
-struct BufferInner {
     data: Box<[u8]>,
 }
 
@@ -58,6 +51,6 @@ impl Deref for Buffer {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &self.arc.data
+        &self.data
     }
 }

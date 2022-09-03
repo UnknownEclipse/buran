@@ -2,24 +2,23 @@ use std::{
     cmp,
     collections::{hash_map::RandomState, HashMap},
     fmt::Debug,
-    hash::{BuildHasher, BuildHasherDefault, Hash},
+    hash::{BuildHasher, Hash},
 };
 
-use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 
-use super::{count_min::Sketch, hash_deque::HashDeque};
+use super::{count_min::Sketch, hash::HashBuilder, hash_lru::HashLru};
 
 #[cfg(test)]
 mod tests;
 
-pub struct CacheBuilder {
+pub struct TinyLfuBuilder {
     pub capacity: usize,
     pub window_fraction: f32,
     pub sketch_coefficient: f32,
 }
 
-impl CacheBuilder {
+impl TinyLfuBuilder {
     pub fn build<T: Copy>(&self) -> TinyLfu<T> {
         self.build_with_hasher(Default::default())
     }
@@ -36,9 +35,9 @@ impl CacheBuilder {
         let (window_size, probation_size, protected_size) =
             compute_cache_sizes(self.capacity, self.window_fraction);
 
-        let window = Lru::with_capacity_and_hasher(window_size, hasher.clone());
-        let probation = Lru::with_capacity_and_hasher(probation_size, hasher.clone());
-        let protected = Lru::with_capacity_and_hasher(protected_size, hasher.clone());
+        let window = HashLru::with_capacity_and_hasher(window_size, hasher.clone());
+        let probation = HashLru::with_capacity_and_hasher(probation_size, hasher.clone());
+        let protected = HashLru::with_capacity_and_hasher(protected_size, hasher.clone());
 
         let regions = HashMap::with_capacity_and_hasher(self.capacity, hasher.clone());
 
@@ -57,10 +56,10 @@ impl CacheBuilder {
     }
 }
 
-pub struct TinyLfu<T: Copy, S = BuildHasherDefault<FxHasher>> {
-    window: Lru<T, S>,
-    probation: Lru<T, S>,
-    protected: Lru<T, S>,
+pub struct TinyLfu<T: Copy, S = HashBuilder> {
+    window: HashLru<T, S>,
+    probation: HashLru<T, S>,
+    protected: HashLru<T, S>,
 
     regions: HashMap<T, Region, S>,
 
@@ -154,6 +153,19 @@ where
         evicted
     }
 
+    pub fn invalidate_all(&mut self) -> Vec<T> {
+        let len = self.probation.deque.len() + self.protected.deque.len() + self.window.deque.len();
+        let mut buf = Vec::with_capacity(len);
+
+        for lru in [&mut self.window, &mut self.probation, &mut self.protected] {
+            while let Some(item) = lru.deque.pop_front() {
+                buf.push(item);
+            }
+        }
+
+        buf
+    }
+
     fn weigher_access(&mut self, item: T) {
         self.freq_sketch.increment(&item);
         self.counter += 1;
@@ -204,6 +216,9 @@ where
     }
 }
 
+/// A variant of [TinyLfu] that applies a hill climber optimization to the window size.
+/// This helps the cache adapt to different workloads, such as a quick burst of a small
+/// set of items.
 pub struct HillClimberTinyLfu<T, S = RandomState>
 where
     T: Copy,
@@ -223,6 +238,7 @@ where
     S: BuildHasher,
 {
     pub fn insert(&mut self, item: T) -> impl Iterator<Item = T> {
+        // Don't allocate in the common case of only a single element being evicted
         let mut evicted = SmallVec::<[T; 1]>::new();
 
         self.counter += 1;
@@ -236,6 +252,7 @@ where
                     1.0
                 };
                 self.frac += self.delta;
+                self.frac = self.frac.clamp(0.0, 1.0);
                 self.prev_hits = self.hits;
                 self.hits = 0;
                 evicted.extend(self.inner.set_window_fraction(self.frac));
@@ -245,78 +262,46 @@ where
         evicted.extend(self.inner.insert(item));
         evicted.into_iter()
     }
-}
 
-struct Lru<T, S> {
-    deque: HashDeque<T, S>,
-    capacity: usize,
-}
-
-impl<T, S> Lru<T, S>
-where
-    T: Copy,
-{
-    pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Lru<T, S> {
-        let deque = HashDeque::with_capacity_and_hasher(capacity, hasher);
-        Lru { deque, capacity }
+    pub fn invalidate_all(&mut self) -> Vec<T> {
+        self.inner.invalidate_all()
     }
 }
 
-impl<T, S> Lru<T, S>
-where
-    T: Copy + Hash + Eq,
-    S: BuildHasher,
-{
-    pub fn is_full(&self) -> bool {
-        self.capacity <= self.deque.len()
-    }
-
-    pub fn insert(&mut self, item: T) -> Option<T> {
-        self.deque.remove(item);
-        self.deque.push_front(item);
-        if self.deque.len() > self.capacity {
-            self.deque.pop_back()
-        } else {
-            None
-        }
-    }
-
-    pub fn try_insert(&mut self, item: T) -> bool {
-        let full = self.is_full();
-        if !full {
-            self.deque.push_front(item);
-        }
-        !full
-    }
-
-    pub fn would_evict(&self) -> Option<T> {
-        if self.deque.len() == self.capacity {
-            self.deque.last()
-        } else {
-            None
-        }
-    }
-
-    pub fn set_capacity(&mut self, capacity: usize) -> Vec<T> {
-        let mut evicted = Vec::new();
-        while capacity < self.deque.len() {
-            evicted.extend(self.deque.pop_front());
-        }
-        self.capacity = capacity;
-        evicted
-    }
+pub struct HillClimberBuilder {
+    /// The step size. Must be within the range 0.0..=1.0
+    pub step_size: f32,
+    /// The amount of access before a step is attempted
+    pub cycle_size: usize,
+    /// The initial tiny lfu options
+    pub tiny_lfu: TinyLfuBuilder,
 }
 
-impl<T, S> Debug for Lru<T, S>
-where
-    T: Debug + Copy + Hash + Eq,
-    S: BuildHasher,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Lru")
-            .field("capacity", &self.capacity)
-            .field("deque", &self.deque)
-            .finish()
+impl HillClimberBuilder {
+    pub fn build<T>(&self) -> HillClimberTinyLfu<T>
+    where
+        T: Copy,
+    {
+        self.build_with_hasher(RandomState::new())
+    }
+
+    pub fn build_with_hasher<T, S>(&self, hasher: S) -> HillClimberTinyLfu<T, S>
+    where
+        T: Copy,
+        S: Clone,
+    {
+        assert!(0.0 <= self.step_size && self.step_size <= 1.0);
+        let inner = self.tiny_lfu.build_with_hasher(hasher);
+
+        HillClimberTinyLfu {
+            inner,
+            prev_hits: 0,
+            hits: 0,
+            frac: self.tiny_lfu.window_fraction,
+            delta: self.step_size,
+            cycle_size: self.cycle_size,
+            counter: 0,
+        }
     }
 }
 
