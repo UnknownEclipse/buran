@@ -3,7 +3,7 @@ use std::{num::NonZeroU64, sync::atomic::Ordering};
 use either::Either;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-use crate::util::count_min::Sketch;
+use crate::util::{count_min::Sketch, hash::TinyHashBuilder};
 
 use super::{Frame, FrameList, ListHead};
 
@@ -21,7 +21,7 @@ pub(super) struct TinyLfuPolicy {
     protected_size: usize,
     protected_capacity: usize,
 
-    freq: Sketch<NonZeroU64>,
+    freq: Sketch<NonZeroU64, TinyHashBuilder>,
     freq_counter: usize,
 }
 
