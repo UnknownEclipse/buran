@@ -8,7 +8,6 @@ use thiserror::Error;
 
 pub mod aligned_slice;
 pub mod alloc_aligned;
-pub mod buffered_file;
 pub mod count_min;
 pub mod hash;
 pub mod hash_deque;
