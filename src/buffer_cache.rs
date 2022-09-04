@@ -16,7 +16,7 @@ use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{util::aligned_slice::alloc_aligned_slice, Result};
 
-use self::{lru2q_policy::Lru2QPolicy, lru_policy::LruPolicy};
+use self::{lru2q_policy::Lru2QPolicy, lru_policy::LruPolicy, tinylfu_policy::TinyLfuPolicy};
 
 mod lru2q_policy;
 mod lru_policy;
@@ -326,6 +326,14 @@ struct FrameList<'a> {
 }
 
 impl<'a> FrameList<'a> {
+    pub fn first(&self) -> Option<usize> {
+        self.head.head
+    }
+
+    pub fn last(&self) -> Option<usize> {
+        self.head.tail
+    }
+
     pub fn pop_back(&mut self) -> Option<usize> {
         let tail = self.head.tail?;
 
@@ -368,6 +376,19 @@ impl<'a> FrameList<'a> {
         }
     }
 
+    pub fn push_front(&mut self, i: usize) {
+        let next = self.head.head;
+        let frame = &self.frames[i];
+        frame.set_next(next, Ordering::Relaxed);
+        frame.set_prev(None, Ordering::Relaxed);
+        if let Some(next) = next {
+            self.frames[next].set_prev(Some(i), Ordering::Relaxed);
+        } else {
+            self.head.tail = Some(i);
+        }
+        self.head.head = Some(i);
+    }
+
     pub fn push_back(&mut self, i: usize) {
         let prev = self.head.tail;
         let frame = &self.frames[i];
@@ -392,6 +413,7 @@ struct ListHead {
 enum CachePolicy {
     Lru(LruPolicy),
     Lru2Q(Mutex<Lru2QPolicy>),
+    TinyLfu(Mutex<TinyLfuPolicy>),
 }
 
 impl CachePolicy {
@@ -399,6 +421,7 @@ impl CachePolicy {
         match self {
             CachePolicy::Lru(policy) => policy.access(frames, frame),
             CachePolicy::Lru2Q(policy) => policy.lock().access(frames, frame),
+            CachePolicy::TinyLfu(policy) => policy.lock().access(frames, frame),
         }
     }
 
@@ -406,6 +429,7 @@ impl CachePolicy {
         match self {
             CachePolicy::Lru(policy) => policy.evict(frames),
             CachePolicy::Lru2Q(policy) => policy.lock().evict(frames),
+            CachePolicy::TinyLfu(policy) => policy.lock().evict(frames),
         }
     }
 
@@ -413,6 +437,7 @@ impl CachePolicy {
         match self {
             CachePolicy::Lru(policy) => policy.insert(frames, frame),
             CachePolicy::Lru2Q(policy) => policy.lock().insert(frames, frame),
+            CachePolicy::TinyLfu(policy) => policy.lock().insert(frames, frame),
         }
     }
 }
