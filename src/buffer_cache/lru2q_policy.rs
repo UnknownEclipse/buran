@@ -7,6 +7,7 @@ use crate::util::{hash::TinyHashBuilder, hash_lru::HashLru};
 
 use super::{Frame, FrameList, ListHead};
 
+/// Implements the [LRU-2Q](https://www.vldb.org/conf/1994/P439.PDF) cache policy.
 pub(super) struct Lru2QPolicy {
     am: ListHead,
     am_len: usize,

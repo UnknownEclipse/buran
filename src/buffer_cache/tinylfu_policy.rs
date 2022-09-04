@@ -7,6 +7,8 @@ use crate::util::{count_min::Sketch, hash::TinyHashBuilder};
 
 use super::{Frame, FrameList, ListHead};
 
+/// An implementation of the [W-TinyLFU](https://ar5iv.labs.arxiv.org/html/1512.00727)
+/// cache policy
 pub(super) struct TinyLfuPolicy {
     /// Window size as a fraction of total capacity
     window_frac: f32,
