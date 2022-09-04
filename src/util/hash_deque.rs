@@ -74,6 +74,10 @@ where
     T: Copy + Eq + Hash,
     S: BuildHasher,
 {
+    pub fn contains(&self, item: T) -> bool {
+        self.data.contains_key(&item)
+    }
+
     pub fn first(&self) -> Option<T> {
         self.head
     }
