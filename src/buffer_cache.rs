@@ -20,6 +20,7 @@ use self::{lru2q_policy::Lru2QPolicy, lru_policy::LruPolicy};
 
 mod lru2q_policy;
 mod lru_policy;
+#[cfg(test)]
 mod tests;
 mod tinylfu_policy;
 
@@ -98,19 +99,12 @@ impl BufferCache {
 
     fn get_empty_frame(&self) -> Result<usize> {
         if let Some(free) = self.pop_free() {
-            println!("using free frame: {}", free);
             return Ok(free);
         }
         let index = self
             .cache_policy
             .evict(&self.frames)
             .expect("cache should never be empty");
-
-        println!(
-            "BufferCache: evicted: {{ frame_index: {}, pgno: {}}}",
-            index,
-            self.frames[index].page_number()
-        );
 
         let frame = &self.frames[index];
 
