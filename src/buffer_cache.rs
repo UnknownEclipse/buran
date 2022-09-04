@@ -24,17 +24,84 @@ mod lru_policy;
 mod tests;
 mod tinylfu_policy;
 
+/// A concurrent buffer cache.
+///
+/// ## Cache Policies
+///
+/// Different cache policies may be beneficial for different workloads. Currently,
+/// three algorithms are supported and may be configured through the builder:
+///
+/// 1. [LRU](
+/// https://en.wikipedia.org/wiki/Cache_replacement_policies#Least_recently_used_(LRU)) - The tried and true
+/// 2. [2Q](https://www.vldb.org/conf/1994/P439.PDF) - A variant of LRU developed for
+/// PostgresQL that uses two primary LRU lists and a third list that remembers if a page
+/// number has been recently accessed. Items re first inserted into one of the LRU lists
+/// called `A1in`. If that page number
+/// is already present in the third list (`A1out`), then it is instead inserted into
+/// the second (main) LRU list (`Am`).
+/// 3. [W-TinyLFU](https://ar5iv.labs.arxiv.org/html/1512.00727) - An algorithm derived
+/// from Java's Caffeine library. This uses a [segmented
+/// LRU](https://en.wikipedia.org/wiki/Cache_replacement_policies#Segmented_LRU_(SLRU))
+/// as its main cache and a much smaller 'window' for new items. Admission into
+/// the main cache is controlled using a
+/// [Count Min Sketch](https://en.wikipedia.org/wiki/Count–min_sketch). When an element
+/// is being inserted into the window, the frequency sketch is checked and if the new item
+/// has a higher access frequency than the item that would be evicted from the main
+/// cache, it is inserted into the main cache.
+///
+/// ## Buffer Allocation and Alignment
+///
+/// Buffers are slices of a single block of memory that is allocated upon creation
+/// of the cache. It is guaranteed that no new buffers will be allocated after
+/// creation (although smaller associated data structures like maps may allocate).
+///
+/// Many I/O subsystems also require buffers aligned to the block size (or cluster size
+/// on windows). As such, alignment may be specified in the builder and it is guaranteed
+/// that all buffers will have at least the requested alignment.
+///
+/// ## Concurrency
+///
+/// Buffers are accessed through guards, which function identically to an ordinary
+/// `RwLock<[u8]>`. As such, it is important that a single thread does not
+/// attempt to read and/or write to more than one buffer at a time, or a deadlock
+/// may occur.
+///
+/// Holding a guard will also prevent that buffer from being reclaimed
+/// by the cache policy, so they should not be held for hugely extended periods of time.
+/// (In practice this should not be an issue. Only the least accessed pages will be
+/// evicted, and in a reasonably large cache it will take a significant amount of
+/// time before a buffer reaches eviction candidate status).
 pub struct BufferCache {
+    /// The memory pool used by the cache. This buffer is divided into smaller frames
+    /// for each buffer.
     memory: UnsafeCell<Box<[MaybeUninit<u8>]>>,
+    /// The metadata for each buffer frame.
     frames: Box<[Frame]>,
+    /// Mapping from page numbers to frame indices
     frame_mappings: DashMap<NonZeroU64, usize>,
+    /// The cache policy used by this cache.
+    // TODO: All current policies are protected by a mutex. While parking_lot spins
+    // for short critical sections, any kind of locking and contention should be
+    // avoided. Caffeine uses a sharded buffer to record accesses that is lazily
+    // emptied. Such a strategy could be employed here.
     cache_policy: CachePolicy,
     adapter: Arc<dyn Adapter + Send + Sync>,
+    /// The size of an individual buffer in the cache. This must be a multiple of the
+    /// required alignment.
     buffer_size: usize,
+    /// A list of free pages. Because the cache will likely fill up quickly,
+    /// an atomic flag is used to indicate if accessing the freelist should even be
+    /// attempted. This turns a mandatory CAS into a simple load in the common
+    /// case of a full cache.
     freelist_head: Mutex<ListHead>,
+    /// Tracks whether the freelist is empty. This is used to fast path new buffer
+    /// allocations (no need to lock the freelist if the freelist is known to be empty)
+    freelist_is_empty: AtomicBool,
 }
 
 impl BufferCache {
+    /// Read a page from the buffer cache, falling bacK to the underlying adapter
+    /// if it does not exist in memory.
     pub fn get(&self, i: NonZeroU64) -> Result<ReadGuard<'_>> {
         match self.frame_mappings.get(&i) {
             Some(frame) => {
@@ -58,28 +125,35 @@ impl BufferCache {
         }
     }
 
+    /// Read a mutable reference to a page from the buffer cache, falling bacK to the
+    /// underlying adapter if it does not exist in memory.
+    ///
+    /// This marks the buffer as dirty, which will be flushed to the underlying
+    /// adapter upon eviction.
     pub fn get_mut(&self, i: NonZeroU64) -> Result<WriteGuard<'_>> {
-        match self.frame_mappings.get(&i) {
+        let guard = match self.frame_mappings.get(&i) {
             Some(frame) => {
                 let guard = self.frames[*frame].lock.write();
                 self.cache_policy.access(&self.frames, *frame);
-                self.frames[*frame].dirty.store(true, Ordering::Relaxed);
-                Ok(WriteGuard {
+                WriteGuard {
                     cache: self,
                     guard,
                     frame: *frame,
-                })
+                }
             }
             None => {
                 let (index, guard) = self.fetch_page(i)?;
-                self.frames[index].dirty.store(true, Ordering::Relaxed);
-                Ok(WriteGuard {
+                WriteGuard {
                     cache: self,
                     guard,
                     frame: index,
-                })
+                }
             }
-        }
+        };
+        self.frames[guard.frame]
+            .dirty
+            .store(true, Ordering::Relaxed);
+        Ok(guard)
     }
 
     fn fetch_page(&self, i: NonZeroU64) -> Result<(usize, RwLockWriteGuard<'_, ()>)> {
@@ -124,7 +198,15 @@ impl BufferCache {
 
     /// Pop a frame from the free list, if there is one
     fn pop_free(&self) -> Option<usize> {
-        self.free_list().pop_back()
+        if self.freelist_is_empty.load(Ordering::Acquire) {
+            None
+        } else {
+            let frame_index = self.free_list().pop_back();
+            if frame_index.is_none() {
+                self.freelist_is_empty.store(true, Ordering::Release);
+            }
+            frame_index
+        }
     }
 
     fn free_list(&self) -> FrameList<'_> {
@@ -164,6 +246,12 @@ pub struct BufferCacheBuilder {
 
 impl BufferCacheBuilder {
     pub fn finish(self) -> BufferCache {
+        assert_eq!(
+            self.buffer_size % self.buffer_align,
+            0,
+            "buffer size must be a multiple of buffer alignment"
+        );
+
         let buffer_size = self.buffer_size * self.capacity;
         let buffer = alloc_aligned_slice(buffer_size, self.buffer_align);
 
@@ -203,6 +291,7 @@ impl BufferCacheBuilder {
             adapter: self.adapter,
             buffer_size: self.buffer_size,
             freelist_head: Mutex::new(freelist),
+            freelist_is_empty: AtomicBool::new(false),
         }
     }
 }
