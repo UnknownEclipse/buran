@@ -4,6 +4,7 @@ use std::{io, result, sync::Arc};
 
 use thiserror::Error;
 
+mod buffer_cache;
 mod device;
 mod store;
 mod sys;
