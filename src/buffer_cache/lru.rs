@@ -1,28 +1,36 @@
-use crate::util::index_deque::{self, IndexDeque};
+use crate::util::index_deque::{self, LruIndexDeque, LruParts};
 
-#[derive(Debug, Default)]
 pub(super) struct Lru {
     links: Box<[index_deque::Link<()>]>,
-    parts: index_deque::Parts,
+    parts: LruParts,
 }
 
 impl Lru {
+    pub fn new(capacity: usize) -> Lru {
+        Lru {
+            links: vec![Default::default(); capacity].into_boxed_slice(),
+            parts: LruParts {
+                deque_parts: Default::default(),
+                capacity,
+                len: 0,
+            },
+        }
+    }
+
     pub fn access(&mut self, index: usize) {
-        let mut d = self.deque();
-        d.remove(index);
-        d.push_back(index);
+        self.lru().access(index);
     }
 
     pub fn insert(&mut self, index: usize) {
-        self.deque().push_back(index);
+        self.lru().insert(index);
     }
 
     pub fn evict(&mut self) -> Option<usize> {
-        self.deque().pop_front()
+        self.lru().evict()
     }
 
-    fn deque(&mut self) -> IndexDeque<'_, ()> {
-        IndexDeque {
+    fn lru(&mut self) -> LruIndexDeque<'_, ()> {
+        LruIndexDeque {
             links: &mut self.links,
             parts: &mut self.parts,
         }

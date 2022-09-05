@@ -176,6 +176,7 @@ impl BufferCache {
 
     fn get_empty_frame(&self) -> Result<usize> {
         if let Some(free) = self.pop_free() {
+            println!("using free frame: {}", free);
             return Ok(free);
         }
         let index = self
@@ -357,7 +358,7 @@ pub enum CachePolicy {
 impl CachePolicy {
     fn build(self, capacity: usize) -> CacheState {
         match self {
-            CachePolicy::Lru => CacheState::Lru(Lru::default()),
+            CachePolicy::Lru => CacheState::Lru(Lru::new(capacity)),
             CachePolicy::Lru2Q(mut builder) => {
                 builder.capacity = capacity;
                 CacheState::Lru2Q(builder.build())

@@ -12,7 +12,10 @@ pub struct Freelist {
 
 impl Freelist {
     pub fn new_full(size: usize) -> Self {
-        let links = (2..size + 1).map(NonZeroUsize::new).collect();
+        let links = (2..size + 1)
+            .map(NonZeroUsize::new)
+            .chain(Some(None))
+            .collect();
 
         let inner = Inner {
             links,

@@ -37,18 +37,18 @@ where
         if let Some(head) = self.parts.head {
             self.set_prev(head.get() - 1, NonZeroUsize::new(index + 1));
         } else {
-            self.parts.tail = NonZeroUsize::new(index);
+            self.parts.tail = NonZeroUsize::new(index + 1);
         }
-        self.parts.head = NonZeroUsize::new(index);
+        self.parts.head = NonZeroUsize::new(index + 1);
     }
 
     pub fn push_back(&mut self, index: usize) {
         if let Some(tail) = self.parts.tail {
-            self.set_next(tail.get() - 1, NonZeroUsize::new(index));
+            self.set_next(tail.get() - 1, NonZeroUsize::new(index + 1));
         } else {
-            self.parts.head = NonZeroUsize::new(index);
+            self.parts.head = NonZeroUsize::new(index + 1);
         }
-        self.parts.tail = NonZeroUsize::new(index);
+        self.parts.tail = NonZeroUsize::new(index + 1);
     }
 
     pub fn pop_front(&mut self) -> Option<usize> {
