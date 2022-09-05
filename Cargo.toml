@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 ahash = "0.8.0"
 backtrace = "0.3.66"
+bitvec = "1.0.1"
 bytemuck = { version = "1.12.1", features = ["derive", "extern_crate_std"] }
 dashmap = "5.4.0"
 either = "1.8.0"

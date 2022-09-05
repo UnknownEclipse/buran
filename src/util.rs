@@ -12,6 +12,7 @@ pub mod count_min;
 pub mod hash;
 pub mod hash_deque;
 pub mod hash_lru;
+pub mod index_deque;
 pub mod slice;
 pub mod thread_id;
 pub mod tiny_lfu;

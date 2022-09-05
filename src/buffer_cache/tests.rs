@@ -1,5 +1,5 @@
 use std::{
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -10,7 +10,7 @@ use dashmap::DashMap;
 
 use crate::Result;
 
-use super::BufferCacheBuilder;
+use super::CacheConfig;
 
 const INITIAL_FILL: u8 = 69;
 
@@ -18,14 +18,14 @@ const INITIAL_FILL: u8 = 69;
 fn buffer_cache() {
     let adapter = Arc::new(Adapter::default());
 
-    let bufcache = BufferCacheBuilder {
+    let bufcache = CacheConfig {
         adapter: adapter.clone(),
-        buffer_align: 1,
-        buffer_size: 128,
-        capacity: 2,
-        cache_policy: super::CachePolicy::Lru(Default::default()),
+        buffer_align: NonZeroUsize::new(1).unwrap(),
+        buffer_size: NonZeroUsize::new(128).unwrap(),
+        capacity: NonZeroUsize::new(2).unwrap(),
+        cache_policy: super::CachePolicy::Lru,
     }
-    .finish();
+    .build();
 
     {
         let guard = bufcache.get(NonZeroU64::new(5).unwrap()).unwrap();

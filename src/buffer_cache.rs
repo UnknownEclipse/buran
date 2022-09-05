@@ -1,28 +1,33 @@
 use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     ops::{Deref, DerefMut},
     slice,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
 
 use dashmap::DashMap;
-use either::Either;
-use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{util::aligned_slice::alloc_aligned_slice, Result};
 
-use self::{lru2q_policy::Lru2QPolicy, lru_policy::LruPolicy, tinylfu_policy::TinyLfuPolicy};
+use self::{
+    freelist::Freelist,
+    lru::Lru,
+    lru2q::{Lru2Q, Lru2QBuilder},
+    wtinylfu::{TinyLfuBuilder, WTinyLfu},
+};
 
-mod lru2q_policy;
-mod lru_policy;
+mod freelist;
+mod lru;
+mod lru2q;
 #[cfg(test)]
 mod tests;
-mod tinylfu_policy;
+mod wtinylfu;
 
 /// A concurrent buffer cache.
 ///
@@ -62,8 +67,8 @@ mod tinylfu_policy;
 /// ## Concurrency
 ///
 /// Buffers are accessed through guards, which function identically to an ordinary
-/// `RwLock<[u8]>`. As such, it is important that a single thread does not
-/// attempt to read and/or write to more than one buffer at a time, or a deadlock
+/// `RwLock*Guard`. As such, it is important that a single thread does not
+/// attempt to read and/or write to a single buffer more than once at a time, or a deadlock
 /// may occur.
 ///
 /// Holding a guard will also prevent that buffer from being reclaimed
@@ -76,6 +81,10 @@ pub struct BufferCache {
     /// for each buffer.
     memory: UnsafeCell<Box<[MaybeUninit<u8>]>>,
     /// The metadata for each buffer frame.
+    // NOTE: Each `Frame` has a lot of metadata. It may be a better idea to move
+    // each bit of metadata into its own array. For example, the linked list used by
+    // the cache policy should be stored by the cache policy itself (this also means
+    // we can do away with the atomics there altogether)
     frames: Box<[Frame]>,
     /// Mapping from page numbers to frame indices
     frame_mappings: DashMap<NonZeroU64, usize>,
@@ -84,19 +93,13 @@ pub struct BufferCache {
     // for short critical sections, any kind of locking and contention should be
     // avoided. Caffeine uses a sharded buffer to record accesses that is lazily
     // emptied. Such a strategy could be employed here.
-    cache_policy: CachePolicy,
+    cache_state: Mutex<CacheState>,
     adapter: Arc<dyn Adapter + Send + Sync>,
     /// The size of an individual buffer in the cache. This must be a multiple of the
     /// required alignment.
     buffer_size: usize,
-    /// A list of free pages. Because the cache will likely fill up quickly,
-    /// an atomic flag is used to indicate if accessing the freelist should even be
-    /// attempted. This turns a mandatory CAS into a simple load in the common
-    /// case of a full cache.
-    freelist_head: Mutex<ListHead>,
-    /// Tracks whether the freelist is empty. This is used to fast path new buffer
-    /// allocations (no need to lock the freelist if the freelist is known to be empty)
-    freelist_is_empty: AtomicBool,
+    /// A list of free pages
+    freelist: Freelist,
 }
 
 impl BufferCache {
@@ -106,10 +109,10 @@ impl BufferCache {
         match self.frame_mappings.get(&i) {
             Some(frame) => {
                 let guard = self.frames[*frame].lock.read();
-                self.cache_policy.access(&self.frames, *frame);
+                self.cache_state.lock().access(&self.frames, *frame);
                 Ok(ReadGuard {
                     cache: self,
-                    guard,
+                    _guard: guard,
                     frame: *frame,
                 })
             }
@@ -118,7 +121,7 @@ impl BufferCache {
                 let guard = RwLockWriteGuard::downgrade(guard);
                 Ok(ReadGuard {
                     cache: self,
-                    guard,
+                    _guard: guard,
                     frame: index,
                 })
             }
@@ -134,7 +137,7 @@ impl BufferCache {
         let guard = match self.frame_mappings.get(&i) {
             Some(frame) => {
                 let guard = self.frames[*frame].lock.write();
-                self.cache_policy.access(&self.frames, *frame);
+                self.cache_state.lock().access(&self.frames, *frame);
                 WriteGuard {
                     cache: self,
                     guard,
@@ -165,7 +168,7 @@ impl BufferCache {
 
         unsafe { self.adapter.read_uninit(i, buffer)? };
         let guard = self.frames[frameno].lock.write();
-        self.cache_policy.insert(&self.frames, frameno);
+        self.cache_state.lock().insert(&self.frames, frameno);
         self.frame_mappings.insert(i, frameno);
         self.frames[frameno].pgno.store(i.get(), Ordering::Relaxed);
         Ok((frameno, guard))
@@ -176,7 +179,8 @@ impl BufferCache {
             return Ok(free);
         }
         let index = self
-            .cache_policy
+            .cache_state
+            .lock()
             .evict(&self.frames)
             .expect("cache should never be empty");
 
@@ -198,22 +202,7 @@ impl BufferCache {
 
     /// Pop a frame from the free list, if there is one
     fn pop_free(&self) -> Option<usize> {
-        if self.freelist_is_empty.load(Ordering::Acquire) {
-            None
-        } else {
-            let frame_index = self.free_list().pop_back();
-            if frame_index.is_none() {
-                self.freelist_is_empty.store(true, Ordering::Release);
-            }
-            frame_index
-        }
-    }
-
-    fn free_list(&self) -> FrameList<'_> {
-        FrameList {
-            frames: &self.frames,
-            head: Either::Left(self.freelist_head.lock()),
-        }
+        self.freelist.pop()
     }
 
     fn frame_data(&self, index: usize) -> *mut [u8] {
@@ -236,62 +225,45 @@ impl BufferCache {
     }
 }
 
-pub struct BufferCacheBuilder {
-    capacity: usize,
-    buffer_align: usize,
-    buffer_size: usize,
-    cache_policy: CachePolicy,
-    adapter: Arc<dyn Send + Sync + Adapter>,
+pub struct CacheConfig {
+    pub capacity: NonZeroUsize,
+    pub buffer_align: NonZeroUsize,
+    pub buffer_size: NonZeroUsize,
+    pub cache_policy: CachePolicy,
+    pub adapter: Arc<dyn Send + Sync + Adapter>,
 }
 
-impl BufferCacheBuilder {
-    pub fn finish(self) -> BufferCache {
+impl CacheConfig {
+    pub fn build(self) -> BufferCache {
+        let bufsize = self.buffer_size.get();
+        let align = self.buffer_align.get();
+        let cap = self.capacity.get();
+
         assert_eq!(
-            self.buffer_size % self.buffer_align,
+            bufsize % align,
             0,
             "buffer size must be a multiple of buffer alignment"
         );
 
-        let buffer_size = self.buffer_size * self.capacity;
-        let buffer = alloc_aligned_slice(buffer_size, self.buffer_align);
+        let buffer_size = bufsize * cap;
+        let buffer = alloc_aligned_slice(buffer_size, align);
 
         let frames = {
-            let mut v = Vec::with_capacity(self.capacity);
-
-            for i in 0..self.capacity {
-                let mut frame = Frame::default();
-
-                // Hook into free list
-                frame.prev = AtomicUsize::new(i);
-                let next = if i + 1 >= self.capacity {
-                    0
-                } else {
-                    // +1 to offset it
-                    // +1 to get the next element
-                    i + 2
-                };
-                frame.next = AtomicUsize::new(next);
-                v.push(frame);
-            }
-
+            let mut v = Vec::with_capacity(cap);
+            v.resize_with(cap, Default::default);
             v.into_boxed_slice()
         };
-        let frame_mappings = Default::default();
 
-        let freelist = ListHead {
-            head: Some(0),
-            tail: Some(self.capacity - 1),
-        };
+        let frame_mappings = Default::default();
 
         BufferCache {
             memory: UnsafeCell::new(buffer),
             frames,
             frame_mappings,
-            cache_policy: self.cache_policy,
+            cache_state: Mutex::new(self.cache_policy.build(cap)),
             adapter: self.adapter,
-            buffer_size: self.buffer_size,
-            freelist_head: Mutex::new(freelist),
-            freelist_is_empty: AtomicBool::new(false),
+            buffer_size: bufsize,
+            freelist: Freelist::new_full(cap),
         }
     }
 }
@@ -299,7 +271,7 @@ impl BufferCacheBuilder {
 pub struct ReadGuard<'a> {
     cache: &'a BufferCache,
     frame: usize,
-    guard: RwLockReadGuard<'a, ()>,
+    _guard: RwLockReadGuard<'a, ()>,
 }
 
 impl<'a> Deref for ReadGuard<'a> {
@@ -321,7 +293,7 @@ impl<'a> WriteGuard<'a> {
         ReadGuard {
             cache: self.cache,
             frame: self.frame,
-            guard: RwLockWriteGuard::downgrade(self.guard),
+            _guard: RwLockWriteGuard::downgrade(self.guard),
         }
     }
 }
@@ -340,9 +312,17 @@ impl<'a> DerefMut for WriteGuard<'a> {
     }
 }
 
+/// The adapter underlying a buffer cache.
+///
+/// This is responsible for only two things: reading and writing complete buffers. All
+/// caching and scheduling is handled by the buffer cache.
 pub trait Adapter {
+    /// Read a new buffer. The provided buffer will be zeroed prior to this function's
+    /// invocation. So avoid the zeroing, see [read_uninit()](Adapter::read_uninit).
     fn read(&self, i: NonZeroU64, buf: &mut [u8]) -> Result<()>;
 
+    /// # Safety
+    /// The buffer must be fully initialized.
     unsafe fn read_uninit(&self, i: NonZeroU64, buf: &mut [MaybeUninit<u8>]) -> Result<()> {
         buf.fill(MaybeUninit::new(0));
         let buf = unsafe { &mut *(buf as *mut [_] as *mut [_]) };
@@ -357,176 +337,73 @@ pub trait Adapter {
 #[derive(Debug, Default)]
 struct Frame {
     lock: RwLock<()>,
-    dirty: AtomicBool,
+    dirty: AtomicBool, // Separate dirty list?
     pgno: AtomicU64,
-    /// These links can be part of one of several lists:
-    /// 1. The free list
-    /// 2. An LRU list if the frame is currently in use
-    next: AtomicUsize,
-    prev: AtomicUsize,
-
-    /// The region of cache this frame is in. This corresponds to the [CacheRegion]
-    /// enum and may be zero if the frame is not in the cache.
-    region: AtomicU8,
 }
 
 impl Frame {
-    pub fn next(&self, ordering: Ordering) -> Option<usize> {
-        let val = self.next.load(ordering);
-        if val == 0 {
-            None
-        } else {
-            Some(val - 1)
-        }
-    }
-
-    pub fn prev(&self, ordering: Ordering) -> Option<usize> {
-        let val = self.prev.load(ordering);
-        if val == 0 {
-            None
-        } else {
-            Some(val - 1)
-        }
-    }
-
-    pub fn set_next(&self, next: Option<usize>, ordering: Ordering) {
-        match next {
-            Some(i) => self.next.store(i + 1, ordering),
-            None => self.next.store(0, ordering),
-        }
-    }
-
-    pub fn set_prev(&self, prev: Option<usize>, ordering: Ordering) {
-        match prev {
-            Some(i) => self.prev.store(i + 1, ordering),
-            None => self.prev.store(0, ordering),
-        }
-    }
-
     pub fn page_number(&self) -> NonZeroU64 {
         let pg = self.pgno.load(Ordering::Relaxed);
         NonZeroU64::new(pg).expect("invalid page number")
     }
 }
 
-struct FrameList<'a> {
-    frames: &'a [Frame],
-    head: Either<MutexGuard<'a, ListHead>, &'a mut ListHead>,
-}
-
-impl<'a> FrameList<'a> {
-    pub fn first(&self) -> Option<usize> {
-        self.head.head
-    }
-
-    pub fn last(&self) -> Option<usize> {
-        self.head.tail
-    }
-
-    pub fn pop_back(&mut self) -> Option<usize> {
-        let tail = self.head.tail?;
-
-        let prev = self.frames[tail].prev(Ordering::Relaxed);
-        if let Some(prev) = prev {
-            self.frames[prev].set_next(None, Ordering::Relaxed);
-        } else {
-            self.head.head = None;
-        }
-        self.head.tail = prev;
-        Some(tail)
-    }
-
-    pub fn pop_front(&mut self) -> Option<usize> {
-        let head = self.head.head?;
-
-        let next = self.frames[head].prev(Ordering::Relaxed);
-        if let Some(next) = next {
-            self.frames[next].set_prev(None, Ordering::Relaxed);
-        } else {
-            self.head.tail = None;
-        }
-        self.head.head = next;
-        Some(head)
-    }
-
-    pub fn remove(&mut self, i: usize) {
-        let next = self.frames[i].next(Ordering::Relaxed);
-        let prev = self.frames[i].prev(Ordering::Relaxed);
-
-        if let Some(next) = next {
-            self.frames[next].set_prev(prev, Ordering::Relaxed);
-        } else {
-            self.head.tail = prev;
-        }
-        if let Some(prev) = prev {
-            self.frames[prev].set_next(next, Ordering::Relaxed);
-        } else {
-            self.head.head = next;
-        }
-    }
-
-    pub fn push_front(&mut self, i: usize) {
-        let next = self.head.head;
-        let frame = &self.frames[i];
-        frame.set_next(next, Ordering::Relaxed);
-        frame.set_prev(None, Ordering::Relaxed);
-        if let Some(next) = next {
-            self.frames[next].set_prev(Some(i), Ordering::Relaxed);
-        } else {
-            self.head.tail = Some(i);
-        }
-        self.head.head = Some(i);
-    }
-
-    pub fn push_back(&mut self, i: usize) {
-        let prev = self.head.tail;
-        let frame = &self.frames[i];
-        frame.set_prev(prev, Ordering::Relaxed);
-        frame.set_next(None, Ordering::Relaxed);
-        if let Some(prev) = prev {
-            self.frames[prev].set_next(Some(i), Ordering::Relaxed);
-        } else {
-            self.head.head = Some(i);
-        }
-        self.head.tail = Some(i);
-    }
-}
-
-/// The head of a frame list
-#[derive(Default)]
-struct ListHead {
-    head: Option<usize>,
-    tail: Option<usize>,
-}
-
-enum CachePolicy {
-    Lru(LruPolicy),
-    Lru2Q(Mutex<Lru2QPolicy>),
-    TinyLfu(Mutex<TinyLfuPolicy>),
+pub enum CachePolicy {
+    Lru,
+    Lru2Q(Lru2QBuilder),
+    TinyLfu(TinyLfuBuilder),
 }
 
 impl CachePolicy {
-    pub fn access(&self, frames: &[Frame], frame: usize) {
+    fn build(self, capacity: usize) -> CacheState {
         match self {
-            CachePolicy::Lru(policy) => policy.access(frames, frame),
-            CachePolicy::Lru2Q(policy) => policy.lock().access(frames, frame),
-            CachePolicy::TinyLfu(policy) => policy.lock().access(frames, frame),
+            CachePolicy::Lru => CacheState::Lru(Lru::default()),
+            CachePolicy::Lru2Q(mut builder) => {
+                builder.capacity = capacity;
+                CacheState::Lru2Q(builder.build())
+            }
+            CachePolicy::TinyLfu(mut builder) => {
+                builder.capacity = capacity;
+                CacheState::TinyLfu(builder.build())
+            }
+        }
+    }
+}
+
+enum CacheState {
+    Lru(Lru),
+    Lru2Q(Lru2Q),
+    TinyLfu(WTinyLfu),
+}
+
+impl CacheState {
+    pub fn access(&mut self, frames: &[Frame], frame: usize) {
+        let get = |i: usize| frames[i].page_number();
+
+        match self {
+            CacheState::Lru(policy) => policy.access(frame),
+            CacheState::Lru2Q(policy) => policy.access(frame),
+            CacheState::TinyLfu(policy) => policy.access(frame, get),
         }
     }
 
-    pub fn evict(&self, frames: &[Frame]) -> Option<usize> {
+    pub fn evict(&mut self, frames: &[Frame]) -> Option<usize> {
+        let get = |i: usize| frames[i].page_number();
+
         match self {
-            CachePolicy::Lru(policy) => policy.evict(frames),
-            CachePolicy::Lru2Q(policy) => policy.lock().evict(frames),
-            CachePolicy::TinyLfu(policy) => policy.lock().evict(frames),
+            CacheState::Lru(policy) => policy.evict(),
+            CacheState::Lru2Q(policy) => policy.evict(get),
+            CacheState::TinyLfu(policy) => policy.evict(),
         }
     }
 
-    pub fn insert(&self, frames: &[Frame], frame: usize) {
+    pub fn insert(&mut self, frames: &[Frame], frame: usize) {
+        let get = |i: usize| frames[i].page_number();
+
         match self {
-            CachePolicy::Lru(policy) => policy.insert(frames, frame),
-            CachePolicy::Lru2Q(policy) => policy.lock().insert(frames, frame),
-            CachePolicy::TinyLfu(policy) => policy.lock().insert(frames, frame),
+            CacheState::Lru(policy) => policy.insert(frame),
+            CacheState::Lru2Q(policy) => policy.insert(frame, get),
+            CacheState::TinyLfu(policy) => policy.insert(frame, get),
         }
     }
 }
