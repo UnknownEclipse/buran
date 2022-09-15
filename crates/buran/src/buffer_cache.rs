@@ -1,134 +1,465 @@
+//! Concurrent Buffer Cache
+//!
+//! ## Todo List
+//! - Better handle 'holes' during reclamation - if the first eviction candidate
+//! is in use or dirty, try the next
+//! - Handle flushes
+
 use std::{
-    cell::UnsafeCell,
-    fmt::Debug,
+    alloc,
+    alloc::{handle_alloc_error, Layout},
+    cmp,
+    hash::BuildHasherDefault,
+    iter,
+    mem::{self, ManuallyDrop, MaybeUninit},
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
-    task::Waker,
-    thread::JoinHandle,
+    ptr::{self, NonNull},
+    slice,
+    sync::{
+        atomic::{AtomicU64, AtomicU8, Ordering},
+        Arc,
+    },
 };
 
-use dashmap::DashMap;
-use flume::Sender;
+use cache_padded::CachePadded;
 use nonmax::NonMaxUsize;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use once_cell::sync::OnceCell;
-use parking_lot::{lock_api::RawRwLock, Mutex};
-use sharded_slab::Slab;
+use parking_lot::{lock_api::RawRwLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use rustc_hash::FxHasher;
 use thread_local::ThreadLocal;
+use yoke::{Yoke, Yokeable};
 
-use crate::{util::future_cell::FutureCell, Error, Result};
-
-use self::{
-    engine::EngineHandle,
-    frames::{FrameRef, Frames},
+use crate::util::{
+    count_min::{self, Sketch},
+    hash_lru::HashLru,
+    index_list::{IndexList, Link},
+    SyncUnsafeCell,
 };
 
-mod buffer_table;
-mod cache_accesses;
-mod dirty;
-mod engine;
-mod frame;
-mod frames;
-mod freelist;
-mod lru;
-mod lru2q;
 #[cfg(test)]
 mod tests;
-mod wtinylfu;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BufId(pub u64);
-
-/// A concurrent buffer cache. Buffers are uniquely identified by a 64bit integer
-/// and may be safely read and written to through guards.
-///
-/// # Implementation
-///
-/// ## The I/O Engine
-///
-/// Because of the highly abstracted nature of requests, the replacement policy and io
-/// can be separated from the rest of the cache. This further allows for the use of
-/// highly efficient I/O techniques and scheduling. Foremost of these is the possibilty
-/// of using `io_uring(2)` with pre-registered buffers (the frames) to reach very high
-/// throughput.
-///
-/// The I/O engine functions almost like a server; requests are submitted by the buffer
-/// cache and the engine fulfills those requests and notifies any waiters (sync or async)
-/// of their completion.
-///
-/// The engine can also perform optimizations such as prefetching and preflushing.
 pub struct BufferCache {
-    frames: Frames,
-    frames_slab: Slab<FetchInner>,
-    table: DashMap<BufId, FrameId>,
-    cache_accesses: CacheAccesses,
-    engine: EngineHandle,
+    arena: Box<SyncUnsafeCell<[MaybeUninit<u8>]>>,
+    count: usize,
+    buffer_size: usize,
+    _buffer_align: usize,
+    buffer_trailing_zeros: u32,
+    descriptors: Arc<[CachePadded<BufferDesc>]>,
+    free: Mutex<IndexList<CachePadded<BufferDesc>>>,
+    /// An LRU dirty list. The least recently written dirty buffers will be flushed first.
+    dirty: Mutex<HashLru<usize, BuildHasherDefault<FxHasher>>>,
+
+    cache_policy: Mutex<CachePolicy>,
+    cache_access_buffers: ThreadLocal<Mutex<Vec<usize>>>,
+    cache_access_buffers_capacity: usize,
 }
 
 impl BufferCache {
-    pub fn get(&self, buf: BufId) -> Result<ReadGuard<'_>> {
-        let frame = match self.table.get(&buf) {
-            Some(id) => {
-                let id = *id;
-                unsafe { FrameRef::from_protected(&self.frames, id) }
-            }
-            None => self.fetch(buf)?.wait()?,
-        };
+    fn pin(&self, id: BufferId) -> Option<Pinned<'_>> {
+        // Take the guard first, to prevent it from being freed between when we
+        // check the epoch and when we create a guard.
 
-        self.cache_accesses.record(buf, frame.id);
-        Ok(ReadGuard::from_frame(frame))
+        let p = Pinned::new(self, id.index());
+        if p.header().generation != id.generation() {
+            None
+        } else {
+            Some(p)
+        }
     }
 
-    fn fetch(&self, buf: BufId) -> Result<Fetch<'_>> {
-        use dashmap::mapref::entry::Entry::*;
+    /// Attempt to get an empty buffer slot.
+    ///
+    /// If all buffers are in use, this will return `None`.
+    pub fn slot(&self, key: u64) -> Option<UninitBuffer<'_>> {
+        if let Some(index) = self.free.lock().pop_front() {
+            let slot = self
+                .init_slot(index, key)
+                .expect("free slot, should not fail");
+            self.cache_policy.lock().insert(index);
+            return Some(slot);
+        }
 
-        let id = self.engine.get_free()?;
+        let mut policy = self.cache_policy.lock();
+        // Ensure rough cache consistency
+        self.drain_cache_accesses(&mut policy);
+        let index = policy.would_evict()?;
 
-        let frame = match self.table.entry(buf) {
-            Occupied(entry) => {
-                self.engine.reclaim(id);
-                unsafe { FrameRef::from_protected(&self.frames, *entry.get()) }
+        let slot = self.init_slot(index, key)?;
+        policy.evict();
+
+        // The slot will insert the value into the cache or the freelist on drop/finish
+        Some(slot)
+    }
+
+    fn init_slot(&self, index: usize, key: u64) -> Option<UninitBuffer<'_>> {
+        let desc = &self.descriptors[index];
+        let mut guard = desc.header.try_write()?;
+
+        if guard.state() == State::Dirty {
+            return None;
+        }
+
+        guard.generation = guard.generation.wrapping_add(1);
+        guard.epoch = AtomicU64::new(0);
+        guard.key = key;
+        guard.state = AtomicU8::new(State::Uninit.into());
+
+        let data_guard = unsafe { UnsafeRwLockWriteGuard::new(guard.data_latch.raw()) };
+        let guard = RwLockWriteGuard::downgrade(guard);
+
+        let pin = Pinned {
+            guard,
+            cache: self,
+            index,
+        };
+
+        Some(UninitBuffer {
+            guard: data_guard,
+            pin,
+            list_guard: UninitBufferListGuard {
+                index,
+                cache: self,
+                enabled: true,
+            },
+        })
+    }
+
+    /// Get an initialized buffer. If the buffer exists, but is not initialized,
+    /// this will return `None`. To wait for initialization to occur before returning,
+    /// see [get_blocking].
+    pub fn get(&self, id: BufferId) -> Option<Buffer<'_>> {
+        let pin = self.pin(id)?;
+        if pin.header().state().is_init() {
+            self.record_access(id.index());
+            Some(Buffer { pin })
+        } else {
+            None
+        }
+    }
+
+    pub fn next_flush(&self) -> Option<Flush<'_>> {
+        loop {
+            let i = self.dirty.lock().would_evict()?;
+            let p = Pinned::new(self, i);
+
+            // let f = Flush {};
+
+            if !p.header().state().is_dirty() {
+                continue;
             }
-            Vacant(entry) => {
-                let f = self.frames.get(id);
-                unsafe {
-                    *f.response.get() = Default::default();
+        }
+    }
+
+    /// Mark a buffer as having been flushed *up to the epoch*. If the buffer has been
+    /// written to since the epoch, the buffer remains dirty.
+    fn mark_flushed(&self, id: BufferId, epoch: u64) {
+        let p = match self.pin(id) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Get shared latch on the buffer to prevent writers from causing races.
+        let _guard = p.header().data_latch.read();
+
+        if epoch != p.header().epoch() {
+            return;
+        }
+
+        p.header().set_clean();
+        self.dirty.lock().deque.remove(p.index);
+    }
+
+    fn data_for_index(&self, index: usize) -> Option<NonNull<[u8]>> {
+        // https://rust-lang.github.io/unsafe-code-guidelines/layout/pointers.html
+        #[repr(C)]
+        struct Slice {
+            ptr: *mut u8,
+            len: usize,
+        }
+
+        if self.count <= index {
+            return None;
+        }
+
+        let ptr = self.arena.get() as *mut MaybeUninit<u8> as *mut u8;
+        let offset = index << self.buffer_trailing_zeros;
+        let len = self.buffer_size;
+        unsafe {
+            let ptr = ptr.add(offset);
+            let slice = Slice { len, ptr };
+            let slice: *mut [u8] = mem::transmute(slice);
+            NonNull::new(slice)
+        }
+    }
+
+    fn record_access(&self, index: usize) {
+        let mut queue = self
+            .cache_access_buffers
+            .get_or(|| Mutex::new(Vec::with_capacity(self.cache_access_buffers_capacity)))
+            .lock();
+
+        if queue.len() == queue.capacity() {
+            let mut policy = self.cache_policy.lock();
+            for index in queue.iter() {
+                policy.access(*index);
+            }
+            queue.clear();
+        }
+
+        queue.push(index);
+    }
+
+    fn drain_cache_accesses(&self, policy: &mut CachePolicy) {
+        for buf in self.cache_access_buffers.iter() {
+            if let Some(mut guard) = buf.try_lock() {
+                for &index in guard.iter() {
+                    policy.access(index);
                 }
-                let frame = unsafe { FrameRef::from_protected(&self.frames, id) };
-                entry.insert(frame.id);
-                frame
+                guard.clear();
             }
+        }
+    }
+}
+
+pub struct Flush<'a> {
+    guard: Yoke<ReadGuard<'static>, Pinned<'a>>,
+}
+
+impl<'a> Flush<'a> {
+    pub fn data(&self) -> &[u8] {
+        self.guard.get()
+    }
+
+    pub fn key(&self) -> u64 {
+        self.guard.get().pin.header().key
+    }
+
+    pub fn buffer_id(&self) -> BufferId {
+        self.guard.get().buffer_id()
+    }
+
+    pub fn finish(self) {
+        let pin = self.guard.get().pin;
+        pin.cache
+            .mark_flushed(pin.buffer_id(), pin.header().epoch());
+    }
+}
+
+pub struct BufferCacheBuilder {
+    capacity: usize,
+    buffer_align: usize,
+    buffer_size: usize,
+}
+
+impl BufferCacheBuilder {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            buffer_align: 1,
+            buffer_size: 512,
+        }
+    }
+
+    pub fn build(self) -> BufferCache {
+        let dirty = Mutex::new(HashLru::with_capacity_and_hasher(
+            self.capacity,
+            Default::default(),
+        ));
+
+        let arena = unsafe {
+            let layout = Layout::array::<u8>(self.buffer_size).unwrap();
+            let layout = layout.align_to(self.buffer_align).unwrap();
+            let layout = layout_repeat(layout, self.capacity).unwrap();
+
+            let ptr = alloc::alloc(layout);
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            let slice: *mut [MaybeUninit<u8>] =
+                slice::from_raw_parts_mut(ptr.cast(), layout.size());
+            let slice = slice as *mut SyncUnsafeCell<[MaybeUninit<u8>]>;
+            Box::from_raw(slice)
         };
-        Ok(Fetch { frame })
+
+        let descriptors: Arc<[CachePadded<BufferDesc>]> = iter::repeat_with(Default::default)
+            .take(self.capacity)
+            .collect();
+
+        let cache_policy = CachePolicy::new(descriptors.clone(), self.capacity);
+
+        let mut free = IndexList {
+            head: None,
+            tail: None,
+            links: descriptors.clone(),
+        };
+        for i in 0..self.capacity {
+            free.push_back(i);
+        }
+        let free = Mutex::new(free);
+
+        BufferCache {
+            arena,
+            _buffer_align: self.buffer_align,
+            buffer_size: self.buffer_size,
+            buffer_trailing_zeros: self.buffer_size.trailing_zeros(),
+            cache_access_buffers: Default::default(),
+            cache_access_buffers_capacity: self.capacity / 2 + 1,
+            count: self.capacity,
+            cache_policy: Mutex::new(cache_policy),
+            descriptors,
+            dirty,
+            free,
+        }
     }
 }
 
-impl Debug for BufferCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BufferCache").finish_non_exhaustive()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BufferId(usize, u64);
+
+impl BufferId {
+    pub fn index(&self) -> usize {
+        self.0
+    }
+
+    fn generation(&self) -> u64 {
+        self.1
     }
 }
 
+struct Pinned<'a> {
+    cache: &'a BufferCache,
+    index: usize,
+    guard: RwLockReadGuard<'a, BufferHeader>,
+}
+
+impl<'a> Pinned<'a> {
+    fn new(cache: &'a BufferCache, index: usize) -> Self {
+        Self {
+            cache,
+            index,
+            guard: cache.descriptors[index].header.read(),
+        }
+    }
+
+    pub fn buffer_id(&self) -> BufferId {
+        BufferId(self.index, self.guard.generation)
+    }
+
+    /// Get the data slice for the buffer pinned by this object. It is important that
+    /// accesses are externally synchronized, and the data is not necessarily initialized.
+    pub fn data(&self) -> NonNull<[u8]> {
+        self.cache
+            .data_for_index(self.index)
+            .expect("data must never be null")
+    }
+
+    pub fn header(&self) -> &BufferHeader {
+        &self.guard
+    }
+}
+
+pub struct Buffer<'a> {
+    pin: Pinned<'a>,
+}
+
+impl<'a> Buffer<'a> {
+    pub fn id(&self) -> BufferId {
+        self.pin.buffer_id()
+    }
+
+    pub fn read(&self) -> ReadGuard<'_> {
+        ReadGuard {
+            guard: self.pin.header().data_latch.read(),
+            pin: &self.pin,
+        }
+    }
+
+    pub fn write(&self) -> WriteGuard<'_> {
+        WriteGuard {
+            guard: self.pin.header().data_latch.write(),
+            pin: &self.pin,
+        }
+    }
+}
+
+struct UninitBufferListGuard<'a> {
+    index: usize,
+    cache: &'a BufferCache,
+    enabled: bool,
+}
+
+impl<'a> Drop for UninitBufferListGuard<'a> {
+    fn drop(&mut self) {
+        if self.enabled {
+            self.cache.free.lock().push_back(self.index);
+        }
+    }
+}
+
+#[must_use = "uninitialized buffers are only useful once they have been written
+to and marked as initialized"]
+pub struct UninitBuffer<'a> {
+    pin: Pinned<'a>,
+    guard: UnsafeRwLockWriteGuard,
+    list_guard: UninitBufferListGuard<'a>,
+}
+
+impl<'a> UninitBuffer<'a> {
+    fn new(pin: Pinned<'a>) -> Self {
+        let guard = unsafe { UnsafeRwLockWriteGuard::new(pin.header().data_latch.raw()) };
+        let list_guard = UninitBufferListGuard {
+            cache: pin.cache,
+            enabled: true,
+            index: pin.index,
+        };
+
+        UninitBuffer {
+            pin,
+            guard,
+            list_guard,
+        }
+    }
+
+    pub fn buffer_id(&self) -> BufferId {
+        self.pin.buffer_id()
+    }
+
+    /// Mark this buffer as initialized.
+    ///
+    /// # Safety
+    /// 1. The buffer must be fully initialized.
+    pub unsafe fn assume_init(mut self) -> Buffer<'a> {
+        self.pin.header().set_init();
+        self.list_guard.enabled = false;
+        self.pin.cache.cache_policy.lock().insert(self.pin.index);
+        Buffer { pin: self.pin }
+    }
+}
+
+impl<'a> Deref for UninitBuffer<'a> {
+    type Target = [MaybeUninit<u8>];
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*(self.pin.data().as_ptr() as *mut [MaybeUninit<u8>]) }
+    }
+}
+
+impl<'a> DerefMut for UninitBuffer<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *(self.pin.data().as_ptr() as *mut [MaybeUninit<u8>]) }
+    }
+}
+
+#[derive(Yokeable)]
 pub struct ReadGuard<'a> {
-    frame: FrameRef<'a>,
+    pin: &'a Pinned<'a>,
+    guard: RwLockReadGuard<'a, ()>,
 }
 
 impl<'a> ReadGuard<'a> {
-    /// # Safety
-    /// 1. The frame must be valid for the lifetime of this guard (in other words,
-    /// the reference count of the frame must include this object)
-    /// 2. The frame must must be locked by a **read** lock.
-    unsafe fn from_raw_frame(frame: FrameRef<'a>) -> Self {
-        Self { frame }
-    }
-
-    fn from_frame(frame: FrameRef<'a>) -> Self {
-        frame.lock.lock_shared();
-        unsafe { Self::from_raw_frame(frame) }
-    }
-
-    fn buffer(&self) -> BufId {
-        self.frame.buffer()
+    pub fn buffer_id(&self) -> BufferId {
+        self.pin.buffer_id()
     }
 }
 
@@ -136,35 +467,34 @@ impl<'a> Deref for ReadGuard<'a> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        unsafe {
-            // SAFETY: We hold a read lock on the frame
-            &*self.frame.data()
-        }
-    }
-}
-
-impl<'a> Drop for ReadGuard<'a> {
-    fn drop(&mut self) {
-        unsafe { self.frame.lock.unlock_shared() };
+        unsafe { self.pin.data().as_ref() }
     }
 }
 
 pub struct WriteGuard<'a> {
-    frame: FrameRef<'a>,
+    pin: &'a Pinned<'a>,
+    guard: RwLockWriteGuard<'a, ()>,
 }
 
 impl<'a> WriteGuard<'a> {
-    /// # Safety
-    /// 1. The frame must be valid for the lifetime of this guard (in other words,
-    /// the reference count of the frame must include this object)
-    /// 2. The frame must must be locked by a **write** lock.
-    unsafe fn from_raw_frame(frame: FrameRef<'a>) -> Self {
-        Self { frame }
+    pub fn downgrade(self) -> ReadGuard<'a> {
+        self.mark_dirty();
+        let this = ManuallyDrop::new(self);
+        unsafe {
+            let pin = this.pin;
+            let guard = ptr::read(&this.guard);
+            let guard = RwLockWriteGuard::downgrade(guard);
+            ReadGuard { pin, guard }
+        }
     }
 
-    fn from_frame(frame: FrameRef<'a>) -> Self {
-        frame.lock.lock_exclusive();
-        Self { frame }
+    pub fn buffer_id(&self) -> BufferId {
+        self.pin.buffer_id()
+    }
+
+    fn mark_dirty(&self) {
+        self.pin.header().set_dirty();
+        self.pin.cache.dirty.lock().insert(self.pin.index);
     }
 }
 
@@ -172,225 +502,766 @@ impl<'a> Deref for WriteGuard<'a> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        unsafe {
-            // SAFETY: We hold a write lock on the frame
-            &*self.frame.data()
-        }
+        unsafe { self.pin.data().as_ref() }
     }
 }
 
 impl<'a> DerefMut for WriteGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe {
-            // SAFETY: We hold a write lock on the frame
-            &mut *self.frame.data()
-        }
+        unsafe { self.pin.data().as_mut() }
     }
 }
 
 impl<'a> Drop for WriteGuard<'a> {
     fn drop(&mut self) {
-        let cas = self
-            .frame
-            .state
-            .compare_exchange(
-                FrameState::Init.into(),
-                FrameState::Dirty.into(),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            )
-            .is_ok();
-        assert!(cas);
-
-        unsafe {
-            // SAFETY: We hold an exclusive lock
-            self.frame.lock.unlock_exclusive();
-        }
+        self.mark_dirty();
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct FrameId(NonMaxUsize);
-
-/// An object that will be asynchronously resolved to a frame by the engine, and
-/// may be waited upon by readers and writers.
-///
-/// ## Implementation Notes
-///
-/// The frame will be initialized with a reference count of 1 that is managed by this
-/// object. When all waiters finish, that 1 will be dropped. This is to prevent the
-/// frame from potentially being freed between when it is allocated and when the
-/// reader bumps the reference count.
 #[derive(Debug, Default)]
-struct MaybeFrame {
-    inner: OnceCell<Result<FrameId>>,
-    wakers: Mutex<Vec<Waker>>,
+struct BufferHeader {
+    pub generation: u64,
+    pub data_latch: RwLock<()>,
+    pub state: AtomicU8,
+    pub epoch: AtomicU64,
+    pub key: u64,
 }
 
-impl MaybeFrame {
-    pub fn new() -> Self {
-        Default::default()
+impl BufferHeader {
+    fn set_init(&self) {
+        debug_assert_eq!(self.state(), State::Uninit);
+        self.set_state(State::Init);
     }
 
-    pub fn wait(&self) -> Result<FrameId> {
-        self.inner
-            .wait()
-            .as_ref()
-            .map_err(Error::clone)
-            .map(|id| *id)
+    fn set_clean(&self) {
+        debug_assert!(self.state().is_init());
+        self.set_state(State::Init);
+    }
+
+    fn set_dirty(&self) {
+        debug_assert!(self.state().is_init());
+        self.set_state(State::Dirty);
+        self.bump_write_epoch();
+    }
+
+    fn state(&self) -> State {
+        self.state_with(Ordering::Acquire)
+    }
+
+    fn state_with(&self, order: Ordering) -> State {
+        self.state.load(order).try_into().unwrap()
+    }
+
+    fn set_state(&self, state: State) {
+        self.set_state_with(state, Ordering::Release)
+    }
+
+    fn set_state_with(&self, state: State, order: Ordering) {
+        self.state.store(state.into(), order)
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    fn bump_write_epoch(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
     }
 }
 
-struct FetchInner {
-    frame: MaybeFrame,
-    frames: Frames,
+#[derive(Debug, Default)]
+struct BufferDesc {
+    header: RwLock<BufferHeader>,
+    cache_link: SyncUnsafeCell<(
+        Option<NonMaxUsize>,
+        Option<NonMaxUsize>,
+        Option<CacheRegion>,
+    )>,
 }
 
-impl Drop for FetchInner {
-    fn drop(&mut self) {
-        if let Ok(id) = self
-            .frame
-            .inner
-            .get()
-            .expect("fetch dropped while executing")
-        {
-            self.frames
-                .get(*id)
-                .refcount
-                .fetch_sub(1, Ordering::Relaxed);
+impl<L> Link for CachePadded<L>
+where
+    L: Link,
+{
+    fn next(&self) -> Option<NonMaxUsize> {
+        self.deref().next()
+    }
+
+    fn prev(&self) -> Option<NonMaxUsize> {
+        self.deref().prev()
+    }
+
+    fn set_next(&self, next: Option<NonMaxUsize>) {
+        self.deref().set_next(next)
+    }
+
+    fn set_prev(&self, prev: Option<NonMaxUsize>) {
+        self.deref().set_prev(prev);
+    }
+}
+
+impl<L> SLruLink for CachePadded<L>
+where
+    L: SLruLink,
+{
+    fn is_protected(&self) -> bool {
+        self.deref().is_protected()
+    }
+
+    fn set_protected(&self) {
+        self.deref().set_protected()
+    }
+
+    fn set_probation(&self) {
+        self.deref().set_probation()
+    }
+}
+
+impl<L> WTinyLfuLink for CachePadded<L>
+where
+    L: WTinyLfuLink,
+{
+    fn is_main(&self) -> bool {
+        self.deref().is_main()
+    }
+
+    fn set_window(&self) {
+        self.deref().set_window()
+    }
+
+    fn key(&self) -> u64 {
+        self.deref().key()
+    }
+}
+
+impl Link for BufferDesc {
+    fn next(&self) -> Option<NonMaxUsize> {
+        unsafe { (*self.cache_link.get()).0 }
+    }
+
+    fn prev(&self) -> Option<NonMaxUsize> {
+        unsafe { (*self.cache_link.get()).1 }
+    }
+
+    fn set_next(&self, next: Option<NonMaxUsize>) {
+        unsafe {
+            (*self.cache_link.get()).0 = next;
+        }
+    }
+
+    fn set_prev(&self, prev: Option<NonMaxUsize>) {
+        unsafe {
+            (*self.cache_link.get()).1 = prev;
         }
     }
 }
 
-struct Frame {
-    lock: parking_lot::RawRwLock,
-    refcount: AtomicUsize,
-    state: AtomicU8,
-    buffer: AtomicU64,
-    response: UnsafeCell<FutureCell<Result<()>>>,
+impl SLruLink for BufferDesc {
+    fn is_protected(&self) -> bool {
+        unsafe { (*self.cache_link.get()).2 == Some(CacheRegion::Protected) }
+    }
+
+    fn set_protected(&self) {
+        unsafe {
+            (*self.cache_link.get()).2 = Some(CacheRegion::Protected);
+        }
+    }
+
+    fn set_probation(&self) {
+        unsafe {
+            (*self.cache_link.get()).2 = Some(CacheRegion::Probation);
+        }
+    }
 }
 
-impl Default for Frame {
-    fn default() -> Self {
-        Self {
-            lock: parking_lot::RawRwLock::INIT,
-            refcount: Default::default(),
-            state: Default::default(),
-            response: Default::default(),
-            buffer: Default::default(),
+impl WTinyLfuLink for BufferDesc {
+    fn is_main(&self) -> bool {
+        unsafe {
+            matches!(
+                (*self.cache_link.get()).2,
+                Some(CacheRegion::Protected | CacheRegion::Probation)
+            )
         }
+    }
+
+    fn set_window(&self) {
+        unsafe {
+            (*self.cache_link.get()).2 = Some(CacheRegion::Window);
+        }
+    }
+
+    fn key(&self) -> u64 {
+        unsafe { (*self.header.data_ptr()).key }
     }
 }
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
-enum FrameState {
-    Empty,
+enum State {
+    Uninit = 0,
     Init,
-    Fetching,
     Dirty,
 }
 
-struct Fetch<'a> {
-    frame: FrameRef<'a>,
-}
+impl State {
+    pub fn is_uninit(&self) -> bool {
+        !self.is_init()
+    }
 
-impl<'a> Fetch<'a> {
-    fn from_frame(frame: FrameRef<'a>) -> Self {
-        Self { frame }
+    pub fn is_init(&self) -> bool {
+        matches!(self, State::Init | State::Dirty)
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        matches!(self, State::Dirty)
     }
 }
 
-impl<'a> Fetch<'a> {
-    /// Wait for the frame to be fetched by the backend
+type CachePolicy = WTinyLfu<CachePadded<BufferDesc>>;
 
-    pub fn wait(self) -> Result<FrameRef<'a>> {
-        let result = unsafe { (*self.frame.response.get()).wait() };
-        clone_result(result)?;
-        Ok(self.frame)
-    }
-
-    pub async fn wait_async(self) -> Result<FrameRef<'a>> {
-        let result = unsafe { (*self.frame.response.get()).wait_async().await };
-        clone_result(result)?;
-        Ok(self.frame)
-    }
+struct Lru<L> {
+    list: IndexList<L>,
 }
 
-struct CacheAccesses {
-    buffer_capacity: usize,
-    buffers: ThreadLocal<Mutex<Vec<(BufId, FrameId)>>>,
-    #[allow(clippy::type_complexity)]
-    sink: Box<dyn Fn(&[(BufId, FrameId)])>,
-}
-
-impl CacheAccesses {
-    pub fn drain_with(&self, mut sink: impl FnMut(&[(BufId, FrameId)])) {
-        for buffer in self.buffers.iter() {
-            let mut buffer = buffer.lock();
-            sink(&buffer);
-            buffer.clear();
-        }
-    }
-
-    pub fn record(&self, buf: BufId, frame: FrameId) {
-        let mut buffer = self
-            .buffers
-            .get_or(|| Mutex::new(Vec::with_capacity(self.buffer_capacity)))
-            .lock();
-
-        if buffer.len() == buffer.capacity() {
-            self.sink(&buffer);
-            buffer.clear();
-        }
-
-        buffer.push((buf, frame));
-    }
-
-    fn sink(&self, buf: &[(BufId, FrameId)]) {
-        (self.sink)(buf);
-    }
-}
-
-fn clone_result<T>(r: &Result<T>) -> Result<T>
+impl<L> Lru<L>
 where
-    T: Clone,
+    L: Link,
 {
-    r.as_ref().map_err(Error::clone).map(|v| v.clone())
+    pub fn new(links: Arc<[L]>) -> Self {
+        Self {
+            list: IndexList {
+                head: None,
+                tail: None,
+                links,
+            },
+        }
+    }
+
+    pub fn access(&mut self, index: usize) {
+        self.list.remove(index);
+        self.list.push_back(index);
+    }
+
+    pub fn insert(&mut self, index: usize) {
+        self.list.push_back(index);
+    }
+
+    pub fn evict(&mut self) -> Option<usize> {
+        self.list.pop_front()
+    }
+
+    pub fn would_evict(&self) -> Option<usize> {
+        self.list.first()
+    }
 }
 
-/// A handle to the backing I/O engine. This allows asynchronous interaction with the
-/// engine by submitting specific requests which are then fulfilled by the engine.
-struct IoEngineHandle {
-    requests: Sender<Request>,
-    join_handle: JoinHandle<()>,
+trait SLruLink: Link {
+    fn is_protected(&self) -> bool;
+    fn set_protected(&self);
+    fn set_probation(&self);
 }
 
-impl IoEngineHandle {
-    pub fn fetch(&self, buf: BufId) {
-        self.send_request(Request::Fetch(buf));
+struct SLru<L> {
+    links: Arc<[L]>,
+    probation: Lru<L>,
+    protected: Lru<L>,
+    protected_size: usize,
+    protected_capacity: usize,
+}
+
+impl<L> SLru<L>
+where
+    L: SLruLink,
+{
+    pub fn new(protected_capacity: usize, links: Arc<[L]>) -> Self {
+        let probation = Lru::new(links.clone());
+        let protected = Lru::new(links.clone());
+
+        Self {
+            links,
+            probation,
+            protected,
+            protected_size: 0,
+            protected_capacity,
+        }
     }
 
-    pub fn dirty(&self, frame: FrameId) {
-        self.send_request(Request::Dirty(frame));
+    pub fn access(&mut self, index: usize) {
+        let protected = self.links[index].is_protected();
+
+        if protected {
+            self.protected.access(index);
+        } else {
+            self.probation.list.remove(index);
+            self.protected.insert(index);
+            self.links[index].set_protected();
+
+            if self.protected_size == self.protected_capacity {
+                if let Some(i) = self.protected.evict() {
+                    self.probation.insert(i);
+                    self.links[i].set_probation();
+                }
+            } else {
+                self.protected_size += 1;
+            }
+        }
     }
 
-    pub fn flush_all(&self) {
-        self.send_request(Request::FlushAll);
+    pub fn insert(&mut self, index: usize) {
+        self.probation.insert(index);
+        self.links[index].set_probation();
     }
 
-    pub fn send_request(&self, request: Request) {
-        self.requests.send(request).unwrap()
+    pub fn evict(&mut self) -> Option<usize> {
+        if let Some(i) = self.probation.evict() {
+            return Some(i);
+        }
+        if let Some(i) = self.protected.evict() {
+            self.protected_size -= 1;
+            return Some(i);
+        }
+        None
+    }
+
+    pub fn would_evict(&self) -> Option<usize> {
+        if let Some(i) = self.probation.would_evict() {
+            return Some(i);
+        }
+        self.protected.would_evict()
+    }
+
+    fn set_protected_capacity(&mut self, protected_capacity: usize) {
+        self.protected_capacity = protected_capacity;
+        self.rebalance();
+    }
+
+    fn rebalance(&mut self) {
+        while self.protected_capacity < self.protected_size {
+            match self.protected.evict() {
+                Some(i) => self.probation.insert(i),
+                None => unreachable!(),
+            }
+        }
+        while self.protected_size < self.protected_capacity {
+            match self.probation.list.pop_back() {
+                Some(i) => self.protected.list.push_front(i),
+                None => break,
+            }
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Request {
-    /// Fetch a buffer
-    Fetch(BufId),
-    /// Invalidate the buffer at the given frame index
-    Invalidate(FrameId),
-    /// Flush all currently dirty frames
-    FlushAll,
-    Dirty(FrameId),
+trait WTinyLfuLink: SLruLink {
+    fn is_main(&self) -> bool;
+    fn set_window(&self);
+    fn key(&self) -> u64;
+}
+
+struct WTinyLfu<L> {
+    links: Arc<[L]>,
+
+    // Caches
+    window: Lru<L>,
+    slru: SLru<L>,
+    capacity: usize,
+    window_percentage: f32,
+    main_size: usize,
+    main_capacity: usize,
+
+    // Hill Climber Optimization
+    hill_climber_delta: f32,
+    hit_rate: usize,
+    prev_hit_rate: usize,
+    hill_climber_cycle_size: usize,
+    hill_climber_counter: usize,
+
+    // Frequency analysis
+    freq_sketch: count_min::Sketch<u64>,
+    freq_counter: usize,
+}
+
+impl<L> WTinyLfu<L>
+where
+    L: WTinyLfuLink,
+{
+    pub fn new(links: Arc<[L]>, capacity: usize) -> Self {
+        let hill_climber_cycle_size = capacity * 10;
+
+        let window = Lru::new(links.clone());
+        let freq_sketch = Sketch::new(capacity * 4);
+
+        // Initialize this properly via the set_window_percentage() call.
+        let slru = SLru::new(0, links.clone());
+
+        let mut tinylfu = Self {
+            capacity,
+            hill_climber_cycle_size,
+            hill_climber_delta: 0.05, // potential tuning parameter
+            freq_counter: 0,
+            main_size: 0,           // initialized by `set_window_percentage()`
+            window_percentage: 0.1, // 10%, should be a decent initial value
+            window,
+            freq_sketch,
+            hill_climber_counter: 0,
+            hit_rate: 0,
+            main_capacity: 0, // initialized by `set_window_percentage()`
+            links,
+            prev_hit_rate: 0,
+            slru,
+        };
+
+        // Initialize things like capacities of the individual caches.
+        tinylfu.set_window_percentage();
+
+        tinylfu
+    }
+
+    pub fn access(&mut self, index: usize) {
+        self.increment(index);
+
+        if self.links[index].is_main() {
+            self.slru.access(index);
+            return;
+        }
+
+        self.window.list.remove(index);
+        self.maybe_promote(index);
+        self.adapt(true);
+    }
+
+    pub fn evict(&mut self) -> Option<usize> {
+        if let Some(i) = self.window.evict() {
+            return Some(i);
+        }
+        self.slru.evict()
+    }
+
+    pub fn would_evict(&self) -> Option<usize> {
+        if let Some(i) = self.window.would_evict() {
+            return Some(i);
+        }
+        self.slru.would_evict()
+    }
+
+    pub fn insert(&mut self, index: usize) {
+        self.increment(index);
+        self.maybe_promote(index);
+        self.adapt(false);
+    }
+
+    fn increment(&mut self, index: usize) {
+        let key = self.links[index].key();
+        self.freq_sketch.increment(&key);
+
+        self.freq_counter += 1;
+
+        if self.freq_sketch.sample_size() <= self.freq_counter {
+            self.freq_counter = 0;
+            self.freq_sketch.halve();
+        }
+    }
+
+    fn get_access_frequency(&mut self, index: usize) -> u32 {
+        let key = self.links[index].key();
+        self.freq_sketch.get(&key)
+    }
+
+    /// Promote an entry to the main cache or insert into the window if not worthy.
+    fn maybe_promote(&mut self, index: usize) {
+        if self.main_size < self.main_capacity {
+            self.slru.insert(index);
+            self.main_size += 1;
+        }
+
+        let other = self.slru.would_evict().unwrap();
+
+        let this = self.get_access_frequency(index);
+        let other_count = self.get_access_frequency(other);
+
+        if this <= other_count {
+            self.window.insert(index);
+            self.links[index].set_window();
+        } else {
+            self.slru.evict();
+            self.slru.insert(index);
+            self.window.insert(other);
+            self.links[index].set_probation();
+            self.links[other].set_window();
+        }
+    }
+
+    /// Apply a hill-climber optimization to the relative size of the window.
+    fn adapt(&mut self, hit: bool) {
+        self.hill_climber_counter += 1;
+
+        if hit {
+            self.hit_rate += 1;
+        }
+
+        if self.hill_climber_counter >= self.hill_climber_cycle_size {
+            self.take_step();
+        }
+    }
+
+    #[cold]
+    fn take_step(&mut self) {
+        self.hill_climber_counter = 0;
+
+        let hit_rate = self.hit_rate;
+        let prev_hit_rate = self.prev_hit_rate;
+
+        self.hit_rate = 0;
+        self.prev_hit_rate = hit_rate;
+
+        let direction = if hit_rate < prev_hit_rate { -1.0 } else { 1.0 };
+        self.hill_climber_delta *= direction;
+        self.window_percentage += self.hill_climber_delta;
+        self.set_window_percentage();
+    }
+
+    fn set_window_percentage(&mut self) {
+        self.window_percentage = self.window_percentage.clamp(0.0, 0.8);
+
+        let window_capacity = (self.capacity as f32 * self.window_percentage) as usize;
+        self.set_main_capacity(self.capacity - window_capacity);
+    }
+
+    fn set_main_capacity(&mut self, main_capacity: usize) {
+        let probation_capacity = main_capacity / 5;
+        let protected_capacity = main_capacity - probation_capacity;
+
+        assert!(1 <= probation_capacity);
+        assert!(1 <= protected_capacity);
+
+        self.slru.set_protected_capacity(protected_capacity);
+        self.main_capacity = main_capacity;
+        self.rebalance();
+    }
+
+    /// Rebalance the cache to ensure all caches are filled to their appropriate
+    /// capacities.
+    fn rebalance(&mut self) {
+        // The main cache shrank
+        while self.main_capacity < self.main_size {
+            let i = match self.slru.evict() {
+                Some(i) => i,
+                None => break,
+            };
+            self.main_size -= 1;
+            self.window.insert(i);
+        }
+        // This goes the other way (the main cache grew)
+        while self.main_size < self.main_capacity {
+            let i = match self.window.list.pop_back() {
+                Some(i) => i,
+                None => break,
+            };
+            self.slru.insert(i);
+            self.main_size += 1;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheRegion {
+    // WTinyLfu
+    Window,
+    // WTinyLfu + SLru
+    Probation,
+    Protected,
+    // 2Q
+    Am,
+    A1In,
+    // ARC
+    L1,
+    L2,
+}
+
+trait TwoQLink: Link {
+    fn is_am(&self) -> bool;
+    fn key(&self) -> u64;
+    fn set_am(&self);
+    fn set_a1in(&self);
+}
+
+struct TwoQ<L> {
+    links: Arc<[L]>,
+    a1in: Lru<L>,
+    a1in_size: usize,
+    a1in_capacity: usize,
+    am: Lru<L>,
+    am_size: usize,
+    am_capacity: usize,
+    a1out: HashLru<u64, BuildHasherDefault<FxHasher>>,
+}
+
+impl<L> TwoQ<L>
+where
+    L: TwoQLink,
+{
+    pub fn new(links: Arc<[L]>, capacity: usize) -> Self {
+        assert!(4 <= capacity);
+
+        let a1in_capacity = cmp::min(capacity / 4, 1);
+        let a1out_capacity = capacity / 2;
+        let am_capacity = capacity - a1in_capacity;
+
+        let a1in = Lru::new(links.clone());
+        let am = Lru::new(links.clone());
+        let a1out = HashLru::with_capacity_and_hasher(a1out_capacity, Default::default());
+
+        Self {
+            links,
+            a1in,
+            a1in_size: 0,
+            a1in_capacity,
+            am,
+            am_size: 0,
+            am_capacity,
+            a1out,
+        }
+    }
+
+    pub fn insert(&mut self, index: usize) {
+        let key = self.links[index].key();
+        if self.a1out.deque.contains(key) {
+            if self.am_size < self.am_capacity {
+                self.am_size += 1;
+            } else {
+                let demoted = self.am.evict().unwrap();
+                self.a1in.insert(demoted);
+                self.links[demoted].set_a1in();
+                self.a1in_size += 1;
+            }
+            self.am.insert(index);
+            self.links[index].set_am();
+        } else {
+            self.a1in.insert(index);
+            self.links[index].set_a1in();
+            self.a1in_size += 1;
+        }
+    }
+
+    pub fn access(&mut self, index: usize) {
+        if self.links[index].is_am() {
+            self.am.access(index);
+        }
+    }
+
+    pub fn evict(&mut self) -> Option<usize> {
+        if self.a1in_size > self.a1in_capacity {
+            let evicted = self.a1in.evict().unwrap();
+            self.a1in_size -= 1;
+            self.a1out.insert(self.links[evicted].key());
+            return Some(evicted);
+        }
+        let evicted = self.am.evict();
+        if evicted.is_some() {
+            self.am_size -= 1;
+        }
+        evicted
+    }
+}
+
+// /// [https://en.wikipedia.org/wiki/Adaptive_replacement_cache]
+// pub struct AdaptiveReplacementCache<L> {
+//     t1: Lru<L>,
+//     t1_size: usize,
+//     t1_capacity: usize,
+//     b1: HashLru<u64, BuildHasherDefault<FxHasher>>,
+
+//     t2: Lru<L>,
+//     t2_size: usize,
+//     t2_capacity: usize,
+//     b2: HashLru<u64, BuildHasherDefault<FxHasher>>,
+
+//     center: usize,
+//     last_inserted_zone: ArcZone,
+
+//     links: Arc<[L]>,
+//     capacity: usize,
+//     adaptation: usize,
+// }
+
+// enum ArcZone {
+//     L1,
+//     L2,
+// }
+
+// impl<L> AdaptiveReplacementCache<L>
+// where
+//     L: Link,
+// {
+//     pub fn access(&mut self, index: usize) {
+//         todo!()
+//     }
+
+//     pub fn evict(&mut self) -> Option<usize> {
+//         let t1_avail = self.t1_capacity - self.t1_size;
+//         let t2_avail = self.t2_capacity - self.t2_size;
+
+//         let preferred = match t1_avail.cmp(&t2_avail) {
+//             cmp::Ordering::Less => ArcZone::L1,
+//             cmp::Ordering::Equal => {
+//                 if self.t1_size < self.t2_size {
+//                     ArcZone::L1
+//                 } else {
+//                     ArcZone::L2
+//                 }
+//             }
+//             cmp::Ordering::Greater => ArcZone::L2,
+//         };
+
+//         match preferred {
+//             ArcZone::L1 => {
+//                 if let Some(i) = self.t1.evict() {
+//                     self.t1_size -= 1;
+//                     return Some(i);
+//                 }
+//                 if let Some(i) = self.t2.evict() {
+//                     self.t2_size -= 1;
+//                     return Some(i);
+//                 }
+//                 None
+//             }
+//             ArcZone::L2 => {
+//                 if let Some(i) = self.t2.evict() {
+//                     self.t2_size -= 1;
+//                     return Some(i);
+//                 }
+//                 if let Some(i) = self.t1.evict() {
+//                     self.t1_size -= 1;
+//                     return Some(i);
+//                 }
+//                 None
+//             }
+//         }
+//     }
+// }
+
+struct UnsafeRwLockWriteGuard {
+    ptr: *const parking_lot::RawRwLock,
+}
+
+unsafe impl Send for UnsafeRwLockWriteGuard {}
+
+impl UnsafeRwLockWriteGuard {
+    pub unsafe fn new(l: &parking_lot::RawRwLock) -> Self {
+        l.lock_exclusive();
+        Self { ptr: l }
+    }
+}
+
+impl Drop for UnsafeRwLockWriteGuard {
+    fn drop(&mut self) {
+        unsafe { (*self.ptr).unlock_exclusive() }
+    }
+}
+
+fn layout_repeat(layout: Layout, count: usize) -> Option<Layout> {
+    if layout.size() % layout.align() != 0 {
+        None
+    } else {
+        Layout::from_size_align(layout.size().checked_mul(count)?, layout.align()).ok()
+    }
 }

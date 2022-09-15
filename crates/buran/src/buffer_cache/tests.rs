@@ -1,94 +1,98 @@
-// use std::{
-//     num::{NonZeroU64, NonZeroUsize},
-//     sync::{
-//         atomic::{AtomicUsize, Ordering},
-//         Arc,
-//     },
-// };
+use std::{
+    cell::Cell,
+    collections::{BTreeSet, VecDeque},
+    iter::{repeat, repeat_with},
+    mem,
+    mem::MaybeUninit,
+    sync::Arc,
+};
 
-// use dashmap::DashMap;
+use nonmax::NonMaxUsize;
+use rand::{thread_rng, Rng};
 
-// use crate::Result;
+use crate::{
+    buffer_cache::BufferCacheBuilder,
+    util::{assert_send, assert_send_sync},
+};
 
-// use super::CacheConfig;
+use super::{Buffer, BufferCache, Lru, ReadGuard, UninitBuffer, WriteGuard};
 
-// const INITIAL_FILL: u8 = 69;
+#[test]
+fn send_sync() {
+    assert_send_sync::<BufferCache>();
 
-// #[test]
-// fn buffer_cache() {
-//     let adapter = Arc::new(Adapter::default());
+    assert_send::<Buffer<'static>>();
+    assert_send::<ReadGuard<'static>>();
+    assert_send::<WriteGuard<'static>>();
+    assert_send::<UninitBuffer<'static>>();
+}
 
-//     let bufcache = CacheConfig {
-//         adapter: adapter.clone(),
-//         buffer_align: NonZeroUsize::new(1).unwrap(),
-//         buffer_size: NonZeroUsize::new(128).unwrap(),
-//         capacity: NonZeroUsize::new(2).unwrap(),
-//         cache_policy: super::CachePolicy::Lru,
-//         cache_access_buffer_capacity: 64,
-//     }
-//     .build();
+#[test]
+fn buffer_cache() {
+    let buffer_cache = BufferCacheBuilder::new(10).build();
 
-//     {
-//         let guard = bufcache.get(NonZeroU64::new(5).unwrap()).unwrap();
-//         assert!(guard.iter().all(|byte| *byte == INITIAL_FILL));
-//     }
-//     {
-//         let mut guard = bufcache.get_mut(NonZeroU64::new(5).unwrap()).unwrap();
-//         guard.fill(66);
-//         assert_eq!(adapter.fault_count.load(Ordering::Relaxed), 1);
-//     }
-//     {
-//         let guard = bufcache.get(NonZeroU64::new(5).unwrap()).unwrap();
-//         assert!(guard.iter().all(|byte| *byte == 66));
-//         assert_eq!(adapter.fault_count.load(Ordering::Relaxed), 1);
-//     }
-//     {
-//         let mut guard = bufcache.get_mut(NonZeroU64::new(6).unwrap()).unwrap();
-//         assert!(guard.iter().all(|byte| *byte == INITIAL_FILL));
-//         guard.fill(66);
-//         assert_eq!(adapter.fault_count.load(Ordering::Relaxed), 2);
-//     }
-//     {
-//         let guard = bufcache.get(NonZeroU64::new(5).unwrap()).unwrap();
-//         assert!(guard.iter().all(|byte| *byte == 66));
-//         assert_eq!(adapter.fault_count.load(Ordering::Relaxed), 2);
-//     }
-//     {
-//         let guard = bufcache.get(NonZeroU64::new(32).unwrap()).unwrap();
-//         assert!(guard.iter().all(|byte| *byte == INITIAL_FILL));
-//         assert_eq!(adapter.fault_count.load(Ordering::Relaxed), 3);
-//     }
-//     {
-//         let guard = bufcache.get(NonZeroU64::new(6).unwrap()).unwrap();
-//         assert!(guard.iter().all(|byte| *byte == 66));
-//         assert_eq!(adapter.fault_count.load(Ordering::Relaxed), 4);
-//     }
-// }
+    let mut pins = VecDeque::new();
 
-// #[derive(Default)]
-// struct Adapter {
-//     blocks: DashMap<NonZeroU64, Vec<u8>>,
-//     fault_count: AtomicUsize,
-// }
+    for i in 0..10 {
+        let mut slot = buffer_cache.slot(i as u64).expect("cache full");
+        slot.fill(MaybeUninit::new(i));
+        let buf1 = unsafe { slot.assume_init() };
+        pins.push_back(buf1);
+    }
 
-// impl super::Adapter for Adapter {
-//     fn read(&self, i: NonZeroU64, buf: &mut [u8]) -> Result<()> {
-//         self.fault_count.fetch_add(1, Ordering::Relaxed);
+    let indices: BTreeSet<_> = pins.iter().map(|p| p.id().index()).collect();
+    // no duplicates
+    assert!(indices.len() == pins.len());
 
-//         if let Some(b) = self.blocks.get(&i) {
-//             buf.copy_from_slice(&*b);
-//         } else {
-//             buf.fill(INITIAL_FILL);
-//         }
-//         Ok(())
-//     }
+    // Cacpacity of 2, both buffers are currently pinned
+    assert!(buffer_cache.slot(11).is_none());
 
-//     fn write(&self, i: NonZeroU64, buf: &[u8]) -> Result<()> {
-//         self.blocks.insert(i, buf.to_owned());
-//         Ok(())
-//     }
+    let buf1 = pins.pop_front().unwrap();
+    let buf1_id = buf1.id();
+    mem::drop(buf1);
 
-//     fn sync(&self) -> Result<()> {
-//         Ok(())
-//     }
-// }
+    let mut slot = buffer_cache.slot(11).expect("cache full");
+    slot.fill(MaybeUninit::new(11));
+    let buf5 = unsafe { slot.assume_init() };
+    assert_eq!(buf1_id.index(), buf5.id().index());
+}
+
+#[test]
+fn lru() {
+    let links: Arc<[_]> = repeat_with(ListHead::default).take(10).collect();
+    let mut lru = Lru::new(links.clone());
+
+    for i in 0..10 {
+        lru.insert(i);
+    }
+
+    dbg!(links);
+    for i in 0..10 {
+        assert_eq!(lru.evict(), Some(i));
+    }
+    assert!(lru.evict().is_none());
+}
+
+#[derive(Debug, Default)]
+struct ListHead {
+    next: Cell<Option<NonMaxUsize>>,
+    prev: Cell<Option<NonMaxUsize>>,
+}
+
+impl super::Link for ListHead {
+    fn next(&self) -> Option<NonMaxUsize> {
+        self.next.get()
+    }
+
+    fn prev(&self) -> Option<NonMaxUsize> {
+        self.prev.get()
+    }
+
+    fn set_next(&self, next: Option<NonMaxUsize>) {
+        self.next.set(next);
+    }
+
+    fn set_prev(&self, prev: Option<NonMaxUsize>) {
+        self.prev.set(prev);
+    }
+}

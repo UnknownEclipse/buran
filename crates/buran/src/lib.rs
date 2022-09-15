@@ -4,9 +4,9 @@ use std::{io, result, sync::Arc};
 
 use thiserror::Error;
 
-mod buffer_cache;
-mod engine;
-mod store;
+pub mod buffer_cache;
+// mod engine;
+// mod store;
 mod sys;
 mod types;
 mod util;

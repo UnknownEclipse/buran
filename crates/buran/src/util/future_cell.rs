@@ -466,6 +466,7 @@ mod v1 {
 mod v2 {
     use std::{
         convert::Infallible,
+        fmt::{Debug, Formatter},
         pin::Pin,
         task::{Context, Poll},
     };
@@ -545,6 +546,17 @@ mod v2 {
 
         pub fn take(&mut self) -> Option<T> {
             self.cell.take()
+        }
+    }
+
+    impl<T> Debug for FutureCell<T>
+    where
+        T: Debug,
+    {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FutureCell")
+                .field("value", &self.get())
+                .finish()
         }
     }
 

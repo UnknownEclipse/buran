@@ -1,22 +1,26 @@
 use std::{
     alloc::{alloc, Layout},
+    cell::UnsafeCell,
     mem::MaybeUninit,
     num::NonZeroUsize,
 };
 
 use thiserror::Error;
 
+pub use self::future_cell::FutureCell;
+
 // pub mod aligned_slice;
 // pub mod alloc_aligned;
 pub mod count_min;
 pub mod endian;
 pub mod future_cell;
+pub mod index_list;
 // pub mod hash;
 pub mod hash_deque;
 pub mod hash_lru;
 // pub mod hybrid_cell;
 pub mod index_deque;
-// pub mod linked_list;
+pub mod linked_list;
 // pub mod slice;
 // pub mod thread_id;
 // pub mod tiny_lfu;
@@ -69,3 +73,46 @@ pub unsafe fn assume_init_slice<T>(slice: &[MaybeUninit<T>]) -> &[T] {
 pub unsafe fn assume_init_slice_mut<T>(slice: &mut [MaybeUninit<T>]) -> &mut [T] {
     unsafe { &mut *(slice as *mut [_] as *mut [_]) }
 }
+
+#[repr(transparent)]
+#[derive(Debug, Default)]
+pub struct SyncUnsafeCell<T: ?Sized>(UnsafeCell<T>);
+
+impl<T> SyncUnsafeCell<T> {
+    pub fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0.into_inner()
+    }
+}
+
+impl<T> SyncUnsafeCell<T>
+where
+    T: ?Sized,
+{
+    pub fn get(&self) -> *mut T {
+        self.0.get()
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        self.0.get_mut()
+    }
+
+    pub fn raw_get(this: *const SyncUnsafeCell<T>) -> *mut T {
+        this as *const T as *mut T
+    }
+}
+
+impl<T> From<T> for SyncUnsafeCell<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+unsafe impl<T: ?Sized + Sync> Sync for SyncUnsafeCell<T> {}
+
+pub fn assert_send_sync<T: ?Sized + Send + Sync>() {}
+pub fn assert_send<T: ?Sized + Send>() {}
+pub fn assert_sync<T: ?Sized + Sync>() {}

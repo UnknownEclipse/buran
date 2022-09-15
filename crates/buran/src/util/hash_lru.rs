@@ -1,12 +1,14 @@
 use std::{
     fmt::Debug,
-    hash::{BuildHasher, Hash},
+    hash::{BuildHasher, BuildHasherDefault, Hash},
 };
+
+use ahash::AHasher;
 
 use super::hash_deque::HashDeque;
 
 /// A simple Lru cache based on a [HashDeque].
-pub struct HashLru<T, S> {
+pub struct HashLru<T, S = BuildHasherDefault<AHasher>> {
     pub deque: HashDeque<T, S>,
     pub capacity: usize,
 }
