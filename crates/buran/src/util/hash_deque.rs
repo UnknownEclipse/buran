@@ -177,6 +177,14 @@ where
     fn links_mut(&mut self, item: T) -> &mut Links<T> {
         self.data.get_mut(&item).expect("broken link")
     }
+
+    pub fn iter(&self) -> Iter<'_, T, S> {
+        Iter {
+            deque: self,
+            front: self.head,
+            back: self.tail,
+        }
+    }
 }
 
 impl<T, S> Default for HashDeque<T, S>
@@ -204,5 +212,37 @@ impl<T> Default for Links<T> {
             next: Default::default(),
             prev: Default::default(),
         }
+    }
+}
+
+pub struct Iter<'a, T, S> {
+    deque: &'a HashDeque<T, S>,
+    front: Option<T>,
+    back: Option<T>,
+}
+
+impl<'a, T, S> Iterator for Iter<'a, T, S>
+where
+    T: Copy + Eq + Hash,
+    S: BuildHasher,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let front = self.front?;
+        self.front = self.deque.links(front).next;
+        Some(front)
+    }
+}
+
+impl<'a, T, S> DoubleEndedIterator for Iter<'a, T, S>
+where
+    T: Copy + Eq + Hash,
+    S: BuildHasher,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let back = self.back?;
+        self.back = self.deque.links(back).prev;
+        Some(back)
     }
 }

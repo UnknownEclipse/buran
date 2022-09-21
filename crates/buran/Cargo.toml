@@ -22,6 +22,7 @@ parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 pin-project-lite = "0.2.9"
 rustc-hash = "1.1.0"
 rustix = { version = "0.35.9", features = ["fs"] }
+seize = "0.2.5"
 sharded-slab = "0.1.4"
 sptr = "0.3.2"
 tempfile = "3.3.0"

@@ -22,12 +22,12 @@ use std::{
 };
 
 use cache_padded::CachePadded;
+use flume::{unbounded, Receiver, Sender};
 use nonmax::NonMaxUsize;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use parking_lot::{lock_api::RawRwLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rustc_hash::FxHasher;
 use thread_local::ThreadLocal;
-use yoke::{Yoke, Yokeable};
 
 use crate::util::{
     count_min::{self, Sketch},
@@ -49,13 +49,51 @@ pub struct BufferCache {
     free: Mutex<IndexList<CachePadded<BufferDesc>>>,
     /// An LRU dirty list. The least recently written dirty buffers will be flushed first.
     dirty: Mutex<HashLru<usize, BuildHasherDefault<FxHasher>>>,
-
     cache_policy: Mutex<CachePolicy>,
     cache_access_buffers: ThreadLocal<Mutex<Vec<usize>>>,
-    cache_access_buffers_capacity: usize,
+    cache_access_buffer_capacity: usize,
+    flushes_sender: Sender<BufferId>,
+    flushes_receiver: Receiver<BufferId>,
 }
 
 impl BufferCache {
+    /// Get an iterator over the addresses and indices of all buffers in this cache.
+    /// This may be used for registering them for use with io_uring.
+    pub fn buffer_addrs(&self) -> impl '_ + Iterator<Item = (usize, *const [u8])> {
+        (0..self.count).filter_map(|i| {
+            self.data_for_index(i)
+                .map(|buf| (i, buf.as_ptr() as *const [_]))
+        })
+    }
+
+    pub fn flushes(&self) -> Receiver<BufferId> {
+        self.flushes_receiver.clone()
+    }
+
+    pub fn get_pending_flushes<'a>(&self, buf: &'a mut [MaybeUninit<BufferId>]) -> &'a [BufferId] {
+        let dirty = self.dirty.lock();
+        let mut iter = dirty.deque.iter().rev();
+
+        let mut i = 0;
+        while i < buf.len() {
+            let index = match iter.next() {
+                Some(v) => v,
+                None => break,
+            };
+            let desc = &self.descriptors[index];
+            let hdr = desc.header.read();
+            if !hdr.state().is_dirty() {
+                continue;
+            }
+            let gen = hdr.generation;
+            let id = BufferId(index, gen);
+            buf[i].write(id);
+            i += 1;
+        }
+
+        unsafe { &*(&buf[..i] as *const [_] as *const [_]) }
+    }
+
     fn pin(&self, id: BufferId) -> Option<Pinned<'_>> {
         // Take the guard first, to prevent it from being freed between when we
         // check the epoch and when we create a guard.
@@ -117,11 +155,6 @@ impl BufferCache {
         Some(UninitBuffer {
             guard: data_guard,
             pin,
-            list_guard: UninitBufferListGuard {
-                index,
-                cache: self,
-                enabled: true,
-            },
         })
     }
 
@@ -143,17 +176,15 @@ impl BufferCache {
             let i = self.dirty.lock().would_evict()?;
             let p = Pinned::new(self, i);
 
-            // let f = Flush {};
-
-            if !p.header().state().is_dirty() {
-                continue;
+            if let Some(flush) = Flush::new(p) {
+                return Some(flush);
             }
         }
     }
 
     /// Mark a buffer as having been flushed *up to the epoch*. If the buffer has been
     /// written to since the epoch, the buffer remains dirty.
-    fn mark_flushed(&self, id: BufferId, epoch: u64) {
+    pub fn mark_flushed(&self, id: BufferId) {
         let p = match self.pin(id) {
             Some(p) => p,
             None => return,
@@ -162,9 +193,9 @@ impl BufferCache {
         // Get shared latch on the buffer to prevent writers from causing races.
         let _guard = p.header().data_latch.read();
 
-        if epoch != p.header().epoch() {
-            return;
-        }
+        // if epoch != p.header().epoch() {
+        //     return;
+        // }
 
         p.header().set_clean();
         self.dirty.lock().deque.remove(p.index);
@@ -196,7 +227,7 @@ impl BufferCache {
     fn record_access(&self, index: usize) {
         let mut queue = self
             .cache_access_buffers
-            .get_or(|| Mutex::new(Vec::with_capacity(self.cache_access_buffers_capacity)))
+            .get_or(|| Mutex::new(Vec::with_capacity(self.cache_access_buffer_capacity)))
             .lock();
 
         if queue.len() == queue.capacity() {
@@ -223,26 +254,39 @@ impl BufferCache {
 }
 
 pub struct Flush<'a> {
-    guard: Yoke<ReadGuard<'static>, Pinned<'a>>,
+    pin: Pinned<'a>,
 }
 
 impl<'a> Flush<'a> {
+    fn new(p: Pinned<'a>) -> Option<Self> {
+        unsafe { p.header().data_latch.raw().lock_shared() };
+        if !p.header().state().is_dirty() {
+            None
+        } else {
+            Some(Self { pin: p })
+        }
+    }
+
     pub fn data(&self) -> &[u8] {
-        self.guard.get()
+        unsafe { self.pin.data().as_ref() }
     }
 
     pub fn key(&self) -> u64 {
-        self.guard.get().pin.header().key
+        self.pin.header().key
     }
 
     pub fn buffer_id(&self) -> BufferId {
-        self.guard.get().buffer_id()
+        self.pin.buffer_id()
     }
 
     pub fn finish(self) {
-        let pin = self.guard.get().pin;
-        pin.cache
-            .mark_flushed(pin.buffer_id(), pin.header().epoch());
+        self.pin.cache.mark_flushed(self.pin.buffer_id());
+    }
+}
+
+impl<'a> Drop for Flush<'a> {
+    fn drop(&mut self) {
+        unsafe { self.pin.header().data_latch.raw().unlock_shared() };
     }
 }
 
@@ -298,18 +342,22 @@ impl BufferCacheBuilder {
         }
         let free = Mutex::new(free);
 
+        let (flushes_sender, flushes_receiver) = unbounded();
+
         BufferCache {
             arena,
             _buffer_align: self.buffer_align,
             buffer_size: self.buffer_size,
             buffer_trailing_zeros: self.buffer_size.trailing_zeros(),
             cache_access_buffers: Default::default(),
-            cache_access_buffers_capacity: self.capacity / 2 + 1,
+            cache_access_buffer_capacity: self.capacity / 2 + 1,
             count: self.capacity,
             cache_policy: Mutex::new(cache_policy),
             descriptors,
             dirty,
             free,
+            flushes_sender,
+            flushes_receiver,
         }
     }
 }
@@ -318,6 +366,8 @@ impl BufferCacheBuilder {
 pub struct BufferId(usize, u64);
 
 impl BufferId {
+    pub const DANGLING: Self = Self(usize::MAX, u64::MAX);
+
     pub fn index(&self) -> usize {
         self.0
     }
@@ -402,23 +452,13 @@ to and marked as initialized"]
 pub struct UninitBuffer<'a> {
     pin: Pinned<'a>,
     guard: UnsafeRwLockWriteGuard,
-    list_guard: UninitBufferListGuard<'a>,
 }
 
 impl<'a> UninitBuffer<'a> {
     fn new(pin: Pinned<'a>) -> Self {
         let guard = unsafe { UnsafeRwLockWriteGuard::new(pin.header().data_latch.raw()) };
-        let list_guard = UninitBufferListGuard {
-            cache: pin.cache,
-            enabled: true,
-            index: pin.index,
-        };
 
-        UninitBuffer {
-            pin,
-            guard,
-            list_guard,
-        }
+        UninitBuffer { pin, guard }
     }
 
     pub fn buffer_id(&self) -> BufferId {
@@ -428,12 +468,19 @@ impl<'a> UninitBuffer<'a> {
     /// Mark this buffer as initialized.
     ///
     /// # Safety
+    ///
     /// 1. The buffer must be fully initialized.
-    pub unsafe fn assume_init(mut self) -> Buffer<'a> {
-        self.pin.header().set_init();
-        self.list_guard.enabled = false;
-        self.pin.cache.cache_policy.lock().insert(self.pin.index);
-        Buffer { pin: self.pin }
+    pub unsafe fn assume_init(self) -> Buffer<'a> {
+        let mut this = ManuallyDrop::new(self);
+
+        unsafe {
+            ptr::drop_in_place(&mut this.guard);
+            let pin = ptr::read(&this.pin);
+            pin.cache.cache_policy.lock().insert(pin.index);
+            pin.header().set_init();
+
+            Buffer { pin }
+        }
     }
 }
 
@@ -451,7 +498,14 @@ impl<'a> DerefMut for UninitBuffer<'a> {
     }
 }
 
-#[derive(Yokeable)]
+impl<'a> Drop for UninitBuffer<'a> {
+    fn drop(&mut self) {
+        // NOTE: This buffer will not be reachable because it is uninit, so .get()
+        // will return None even with the correct id.
+        self.pin.cache.free.lock().push_back(self.pin.index);
+    }
+}
+
 pub struct ReadGuard<'a> {
     pin: &'a Pinned<'a>,
     guard: RwLockReadGuard<'a, ()>,
@@ -1264,4 +1318,8 @@ fn layout_repeat(layout: Layout, count: usize) -> Option<Layout> {
     } else {
         Layout::from_size_align(layout.size().checked_mul(count)?, layout.align()).ok()
     }
+}
+
+struct BufferInner {
+    data: RwLock<[u8]>,
 }

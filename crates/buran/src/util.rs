@@ -9,21 +9,15 @@ use thiserror::Error;
 
 pub use self::future_cell::FutureCell;
 
-// pub mod aligned_slice;
-// pub mod alloc_aligned;
 pub mod count_min;
 pub mod endian;
 pub mod future_cell;
-pub mod index_list;
-// pub mod hash;
 pub mod hash_deque;
 pub mod hash_lru;
-// pub mod hybrid_cell;
 pub mod index_deque;
+pub mod index_list;
 pub mod linked_list;
-// pub mod slice;
-// pub mod thread_id;
-// pub mod tiny_lfu;
+pub mod unordered_deque;
 
 /// # Safety
 /// The contents of b must be fully initialized.

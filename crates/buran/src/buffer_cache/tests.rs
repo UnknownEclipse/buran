@@ -1,21 +1,20 @@
 use std::{
     cell::Cell,
     collections::{BTreeSet, VecDeque},
-    iter::{repeat, repeat_with},
+    iter::repeat_with,
     mem,
     mem::MaybeUninit,
     sync::Arc,
 };
 
 use nonmax::NonMaxUsize;
-use rand::{thread_rng, Rng};
 
 use crate::{
     buffer_cache::BufferCacheBuilder,
     util::{assert_send, assert_send_sync},
 };
 
-use super::{Buffer, BufferCache, Lru, ReadGuard, UninitBuffer, WriteGuard};
+use super::{Buffer, BufferCache, Flush, Lru, ReadGuard, UninitBuffer, WriteGuard};
 
 #[test]
 fn send_sync() {
@@ -25,6 +24,7 @@ fn send_sync() {
     assert_send::<ReadGuard<'static>>();
     assert_send::<WriteGuard<'static>>();
     assert_send::<UninitBuffer<'static>>();
+    assert_send::<Flush<'static>>();
 }
 
 #[test]

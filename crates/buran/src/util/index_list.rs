@@ -88,6 +88,14 @@ where
     pub fn last(&self) -> Option<usize> {
         self.tail.map(|v| v.get())
     }
+
+    pub fn iter(&self) -> Iter<'_, L> {
+        Iter {
+            front: self.head,
+            back: self.tail,
+            list: self,
+        }
+    }
 }
 
 pub trait Link {
@@ -95,4 +103,36 @@ pub trait Link {
     fn prev(&self) -> Option<NonMaxUsize>;
     fn set_next(&self, next: Option<NonMaxUsize>);
     fn set_prev(&self, prev: Option<NonMaxUsize>);
+}
+
+pub struct Iter<'a, L> {
+    front: Option<NonMaxUsize>,
+    back: Option<NonMaxUsize>,
+    list: &'a IndexList<L>,
+}
+
+impl<'a, L> Iterator for Iter<'a, L>
+where
+    L: Link,
+{
+    type Item = &'a L;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let front = self.front?;
+        let item = &self.list.links[front.get()];
+        self.front = item.next();
+        Some(item)
+    }
+}
+
+impl<'a, L> DoubleEndedIterator for Iter<'a, L>
+where
+    L: Link,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let back = self.back?;
+        let item = &self.list.links[back.get()];
+        self.back = item.prev();
+        Some(item)
+    }
 }

@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     sync::Arc,
 };
@@ -92,6 +92,10 @@ impl File {
 
     pub fn sync_all(&self) -> io::Result<()> {
         self.0.sync_all()
+    }
+
+    pub fn set_len(&self, size: u64) -> io::Result<()> {
+        self.0.set_len(size)
     }
 }
 
@@ -196,6 +200,20 @@ where
     }
 }
 
+impl<T> BufRead for Tracked<T>
+where
+    T: BufRead,
+{
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.0.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.0.consume(amt);
+        self.1 += amt as u64;
+    }
+}
+
 impl<T> Write for Tracked<T>
 where
     T: Write,
@@ -209,6 +227,12 @@ where
     fn flush(&mut self) -> io::Result<()> {
         self.0.flush()
     }
+
+    fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
+        self.0.write_all(buf)?;
+        self.1 += buf.len() as u64;
+        Ok(())
+    }
 }
 
 impl<T> Seek for Tracked<T>
@@ -218,6 +242,21 @@ where
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.1 = self.0.seek(pos)?;
         Ok(self.1)
+    }
+}
+
+impl<R> Tracked<BufReader<R>>
+where
+    R: Seek,
+{
+    pub fn seek_relative(&mut self, offset: i64) -> io::Result<()> {
+        self.0.seek_relative(offset)?;
+        if offset < 0 {
+            self.1 -= offset as u64;
+        } else {
+            self.1 += offset as u64;
+        }
+        todo!()
     }
 }
 

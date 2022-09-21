@@ -5,6 +5,8 @@ use std::{io, result, sync::Arc};
 use thiserror::Error;
 
 pub mod buffer_cache;
+mod page_cache;
+mod page_table;
 // mod engine;
 // mod store;
 mod sys;
